@@ -525,10 +525,90 @@ def cmd_snapshot(args: list) -> int:
     if sub == "capture":
         return cmd_snapshot_capture(args[1:])
     if sub == "diff":
-        print("Not yet implemented in Task 2.4", file=sys.stderr)
-        return 2
+        return cmd_snapshot_diff(args[1:])
     print(f"Unknown snapshot subcommand: {sub}", file=sys.stderr)
     return 2
+
+
+def cmd_snapshot_diff(args: list) -> int:
+    """Symmetric per-file diff. Snapshot side uses persisted fileManifest
+    (stable across mid-task .gitignore changes). Live side uses
+    capturedGitignoreRules + capturedIgnoredPaths (also stable). Secret
+    patterns enforced at diff time as a non-overridable safety net."""
+    if len(args) != 2:
+        print("Usage: 3p.py snapshot diff <run-id> <key>", file=sys.stderr)
+        return 2
+    run_id, key = args
+    anchor, is_git = find_anchor()
+    run_dir = run_dir_path(anchor, run_id)
+    state = read_state(run_dir)
+    baseline_meta = state["baselines"][key]
+    snap_path = Path(baseline_meta["path"])
+    cfg = state["resolvedConfig"]
+    if "fileManifest" in baseline_meta:
+        snap_files = set(baseline_meta["fileManifest"])
+    else:
+        gi_rules_legacy = gitignore_rules(anchor)
+        snap_files = set(enumerate_files_nongit(
+            snap_path, cfg["excludes"], cfg["secretPatterns"], gi_rules_legacy
+        ))
+    captured_gi = [tuple(t) for t in baseline_meta.get("capturedGitignoreRules", [])]
+    if captured_gi:
+        gi_rules = captured_gi
+    else:
+        gi_rules = gitignore_rules(anchor)
+    live_files = set(enumerate_files(
+        anchor, cfg["excludes"], cfg["secretPatterns"], gi_rules, is_git
+    ))
+    captured_ignored = set(baseline_meta.get("capturedIgnoredPaths", []))
+    if captured_ignored:
+        live_files -= captured_ignored
+    snap_files = {p for p in snap_files
+                  if not should_exclude(p, cfg["secretPatterns"])}
+    union = sorted(snap_files | live_files)
+    out_lines = []
+    for rel in union:
+        snap_file = snap_path / rel
+        live_file = anchor / rel
+        snap_exists = snap_file.exists()
+        live_exists = live_file.exists()
+        if snap_exists and live_exists:
+            r = _sp.run(["diff", "-u", str(snap_file), str(live_file)],
+                        capture_output=True, text=True)
+            if r.stdout:
+                out_lines.append(f"diff -ruN {snap_file} {live_file}\n")
+                out_lines.append(r.stdout)
+        elif live_exists:
+            r = _sp.run(["diff", "-uN", "/dev/null", str(live_file)],
+                        capture_output=True, text=True)
+            out_lines.append(f"Only in {anchor}: {rel}\n")
+            if r.stdout:
+                out_lines.append(r.stdout)
+        elif snap_exists:
+            r = _sp.run(["diff", "-uN", str(snap_file), "/dev/null"],
+                        capture_output=True, text=True)
+            out_lines.append(f"Only in {snap_path}: {rel}\n")
+            if r.stdout:
+                out_lines.append(r.stdout)
+    sys.stdout.write("".join(out_lines))
+    return 0
+
+
+def _parse_diff_header_paths(rest: str, snap_str: str, anchor_str: str) -> str:
+    """Extract relative path from a 'diff -ruN PATH_A PATH_B' line,
+    robust to spaces. PATH_A starts with snap_str or anchor_str."""
+    for base_a in (snap_str, anchor_str):
+        if rest.startswith(base_a + os.sep):
+            other = anchor_str if base_a == snap_str else snap_str
+            needle = " " + other + os.sep
+            idx = rest.find(needle)
+            if idx != -1:
+                return os.path.relpath(rest[:idx], base_a)
+            needle2 = " " + other
+            idx2 = rest.find(needle2)
+            if idx2 != -1:
+                return os.path.relpath(rest[:idx2], base_a)
+    return ""
 
 
 def cmd_snapshot_capture(args: list) -> int:
