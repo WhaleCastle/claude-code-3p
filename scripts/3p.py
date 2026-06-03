@@ -896,6 +896,38 @@ def _enumerate_diff_paths(anchor: Path, state: dict, run_id: str) -> list:
     return sorted(paths)
 
 
+def cmd_list(args: list) -> int:
+    anchor, _ = find_anchor()
+    base = anchor / ".3p"
+    if not base.exists():
+        return 0
+    for run_dir in sorted(base.iterdir()):
+        state_f = run_dir / "state.json"
+        if state_f.exists():
+            state = json.loads(state_f.read_text())
+            print(f"{run_dir.name}\t{state.get('phase')}\t{state.get('taskSlug')}")
+    return 0
+
+
+def cmd_clean(args: list) -> int:
+    if len(args) != 1:
+        print("Usage: 3p.py clean <run-id>", file=sys.stderr)
+        return 2
+    run_id = args[0]
+    anchor, is_git = find_anchor()
+    run_dir = run_dir_path(anchor, run_id)
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
+    if is_git:
+        refs = _sp.run(
+            ["git", "for-each-ref", f"refs/3p/{run_id}/", "--format=%(refname)"],
+            cwd=anchor, capture_output=True, text=True,
+        ).stdout.splitlines()
+        for ref in refs:
+            _sp.run(["git", "update-ref", "-d", ref], cwd=anchor)
+    return 0
+
+
 def cmd_consolidate_final(args: list) -> int:
     """Consolidate per-reviewer final-round-*.md files into final-review.md."""
     if len(args) != 1:
@@ -966,6 +998,8 @@ def main(argv: list) -> int:
         "round-write": cmd_round_write,
         "summary": cmd_summary,
         "consolidate-final": cmd_consolidate_final,
+        "list": cmd_list,
+        "clean": cmd_clean,
     }
     if cmd not in dispatcher:
         print(f"Unknown subcommand: {cmd}\n\n{USAGE}", file=sys.stderr)
