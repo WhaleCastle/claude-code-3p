@@ -2,8 +2,115 @@
 """3p — three-party review skill helper. Subcommand-based CLI."""
 import sys
 import hashlib
+import json
 import re
 import subprocess as _sp
+from pathlib import Path
+
+
+HARDCODED_SECRET_PATTERNS = [
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "id_rsa",
+    "id_rsa.*",
+    "id_ed25519",
+    "id_ed25519.*",
+    "**/.aws/credentials",
+    "**/.aws/config",
+    ".npmrc",
+    ".netrc",
+    "secrets.*",
+    "**/credentials.json",
+]
+
+DEFAULT_BLOAT_EXCLUDES = [
+    "node_modules/",
+    "__pycache__/",
+    ".venv/",
+    "venv/",
+    ".tox/",
+    "dist/",
+    "build/",
+    "target/",
+    ".next/",
+    ".nuxt/",
+    ".cache/",
+    "*.log",
+    "*.pyc",
+    ".DS_Store",
+]
+
+DEFAULTS = {
+    "timeoutSeconds": 120,
+    "roundCap": 10,
+    "consecutiveFailuresForDowngrade": 3,
+    "excludes": list(DEFAULT_BLOAT_EXCLUDES),
+    "secretPatterns": list(HARDCODED_SECRET_PATTERNS),
+}
+
+
+def load_config(anchor: Path, config_path=None, cli_excludes=None) -> dict:
+    """Merge defaults <- config file <- CLI flags.
+    - `excludes` in config file REPLACES defaults (user-overridable bloat list).
+    - `extraExcludes` in config file APPENDS to defaults.
+    - CLI `--exclude` flags always APPEND on top.
+    - Secret patterns are NEVER overridable.
+    """
+    cfg = json.loads(json.dumps(DEFAULTS))  # deep copy
+    file_path = config_path or (anchor / ".3p" / "config.json")
+    if file_path.exists():
+        try:
+            file_cfg = json.loads(file_path.read_text())
+        except json.JSONDecodeError as e:
+            print(f"Warning: ignoring malformed {file_path}: {e}", file=sys.stderr)
+            file_cfg = {}
+        for k, v in file_cfg.items():
+            if k == "excludes":
+                cfg["excludes"] = list(v)  # replace defaults
+            elif k == "extraExcludes":
+                for x in v:
+                    if x not in cfg["excludes"]:
+                        cfg["excludes"].append(x)
+            elif k == "secretPatterns":
+                merged = list(HARDCODED_SECRET_PATTERNS)
+                for x in v:
+                    if x not in merged:
+                        merged.append(x)
+                cfg["secretPatterns"] = merged
+            else:
+                cfg[k] = v
+    if cli_excludes:
+        for x in cli_excludes:
+            if x not in cfg["excludes"]:
+                cfg["excludes"].append(x)
+    for p in HARDCODED_SECRET_PATTERNS:
+        if p not in cfg["secretPatterns"]:
+            cfg["secretPatterns"].append(p)
+    return cfg
+
+
+def cmd_config_load(args: list) -> int:
+    config_path = None
+    cli_excludes = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--config":
+            config_path = Path(args[i + 1])
+            i += 2
+        elif args[i] == "--exclude":
+            cli_excludes.append(args[i + 1])
+            i += 2
+        else:
+            print(f"Unknown flag: {args[i]}", file=sys.stderr)
+            return 2
+    anchor = Path.cwd()
+    cfg = load_config(anchor, config_path, cli_excludes)
+    print(json.dumps(cfg, indent=2))
+    return 0
 
 
 USAGE = """\
@@ -81,6 +188,7 @@ def main(argv: list) -> int:
     args = argv[2:]
     dispatcher = {
         "slug": cmd_slug,
+        "config-load": cmd_config_load,
     }
     if cmd not in dispatcher:
         print(f"Unknown subcommand: {cmd}\n\n{USAGE}", file=sys.stderr)
