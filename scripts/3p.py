@@ -783,6 +783,171 @@ def cmd_round_write(args: list) -> int:
     return 0
 
 
+def cmd_summary(args: list) -> int:
+    if len(args) != 1:
+        print("Usage: 3p.py summary <run-id>", file=sys.stderr)
+        return 2
+    run_id = args[0]
+    anchor, _ = find_anchor()
+    run_dir = run_dir_path(anchor, run_id)
+    state = read_state(run_dir)
+    task = (run_dir / "task.txt").read_text() if (run_dir / "task.txt").exists() else "(no task.txt)"
+    plan = (run_dir / "plan.md").read_text() if (run_dir / "plan.md").exists() else "(no plan.md)"
+
+    rounds = sorted(run_dir.glob("plan-round-*.md")) \
+        + sorted(run_dir.glob("step-*-round-*.md")) \
+        + sorted(run_dir.glob("final-round-*.md"))
+    step_summaries = sorted(run_dir.glob("step-*-summary.md"))
+    changed_files = _enumerate_diff_paths(anchor, state, run_id)
+
+    out = [
+        f"# /3p Run Summary — {run_id}",
+        "",
+        "## Original task",
+        "",
+        f"> {task.strip()}",
+        "",
+        "## Final approved plan",
+        "",
+        plan.strip(),
+        "",
+        "## Per-step summaries",
+        "",
+    ]
+    for s in step_summaries:
+        out += [f"### {s.name}", "", s.read_text().strip(), ""]
+    out += ["## Round-by-round audit trail", ""]
+    for r in rounds:
+        out += [f"### {r.name}", "", r.read_text().strip(), ""]
+    fr = run_dir / "final-review.md"
+    if fr.exists():
+        out += ["## Phase C consolidated final-review.md", "", fr.read_text().strip(), ""]
+    out += [
+        "## Reviewer availability log (full history)",
+        "",
+        "| Phase | Step | Round | Reviewer | Status | Reason | Duration (s) |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for e in state.get("availabilityLog", []):
+        out.append(
+            f"| {e.get('phase','')} | {e.get('step','-') or '-'} | "
+            f"{e.get('round','')} | {e.get('reviewer','')} | "
+            f"{e.get('status','')} | {e.get('reason','-') or '-'} | "
+            f"{e.get('durationSeconds','')} |"
+        )
+    out += ["",
+            "Current reviewer health counters:",
+            "",
+            f"```json\n{json.dumps(state.get('reviewerHealth', {}), indent=2)}\n```",
+            ""]
+    if state.get("downgradeMode"):
+        out += ["## Downgrade mode", "",
+                f"Active: {json.dumps(state['downgradeMode'], indent=2)}", ""]
+    out += [
+        "## Uncommitted-state notice",
+        "",
+        "The following files were modified during Phase B and remain on disk uncommitted. "
+        "`/3p` does not touch git history — you are responsible for staging/committing/reverting.",
+        "",
+        "Changed/new files:",
+        "",
+    ]
+    for p in changed_files:
+        out.append(f"- `{p}`")
+    out += ["", f"Audit trail location: `{run_dir}`", ""]
+    (run_dir / "summary.md").write_text("\n".join(out))
+    return 0
+
+
+def _enumerate_diff_paths(anchor: Path, state: dict, run_id: str) -> list:
+    if "pre-build" not in state.get("baselines", {}):
+        return []
+    snap_str = str(Path(state["baselines"]["pre-build"]["path"]))
+    anchor_str = str(anchor)
+    run_dir = run_dir_path(anchor, run_id)
+    final_diff = run_dir / "final-diff.txt"
+    if final_diff.exists():
+        diff_text = final_diff.read_text()
+    else:
+        proc = _sp.run(
+            [sys.executable, __file__, "snapshot", "diff", run_id, "pre-build"],
+            cwd=anchor, capture_output=True, text=True,
+        )
+        diff_text = proc.stdout
+    paths = set()
+    for line in diff_text.splitlines():
+        if line.startswith("diff -ruN "):
+            rest = line[len("diff -ruN "):]
+            rel = _parse_diff_header_paths(rest, snap_str, anchor_str)
+            if rel:
+                paths.add(rel)
+        elif line.startswith("Only in "):
+            rest = line[len("Only in "):]
+            sep = rest.rfind(": ")
+            if sep == -1:
+                continue
+            dir_part = rest[:sep]
+            name = rest[sep + 2:]
+            if dir_part == snap_str or dir_part.startswith(snap_str + os.sep):
+                rel = os.path.relpath(os.path.join(dir_part, name), snap_str)
+            else:
+                rel = os.path.relpath(os.path.join(dir_part, name), anchor_str)
+            paths.add(rel)
+    return sorted(paths)
+
+
+def cmd_consolidate_final(args: list) -> int:
+    """Consolidate per-reviewer final-round-*.md files into final-review.md."""
+    if len(args) != 1:
+        print("Usage: 3p.py consolidate-final <run-id>", file=sys.stderr)
+        return 2
+    run_id = args[0]
+    anchor, _ = find_anchor()
+    run_dir = run_dir_path(anchor, run_id)
+    state = read_state(run_dir)
+    round_files = sorted(run_dir.glob("final-round-*.md"))
+    rounds_by_num = {}
+    for rf in round_files:
+        parts = rf.stem.split("-")
+        try:
+            n = int(parts[2])
+        except (IndexError, ValueError):
+            continue
+        rounds_by_num.setdefault(n, []).append(rf)
+    phase_c_log = [e for e in state.get("availabilityLog", []) if e.get("phase") == "final"]
+    exit_status = "cap-reached"
+    if rounds_by_num:
+        last_n = max(rounds_by_num)
+        last_files = rounds_by_num[last_n]
+        approvals = sum("**APPROVED**" in p.read_text() for p in last_files)
+        if approvals >= 2:
+            exit_status = "approved"
+        elif state.get("downgradeMode") and approvals >= 1:
+            exit_status = "approved (downgrade-mode)"
+    out = [
+        "# Phase C — Final Review",
+        "",
+        f"_Exit: **{exit_status}** after {len(rounds_by_num)} round(s)_",
+        "",
+    ]
+    for r in round_files:
+        out += [f"## {r.name}", "", r.read_text().strip(), ""]
+    out += [
+        "## Phase C reviewer availability",
+        "",
+        "| Round | Reviewer | Status | Reason | Duration (s) |",
+        "|---|---|---|---|---|",
+    ]
+    for e in phase_c_log:
+        out.append(
+            f"| {e.get('round','')} | {e.get('reviewer','')} | "
+            f"{e.get('status','')} | {e.get('reason','-') or '-'} | "
+            f"{e.get('durationSeconds','')} |"
+        )
+    (run_dir / "final-review.md").write_text("\n".join(out) + "\n")
+    return 0
+
+
 def main(argv: list) -> int:
     if len(argv) < 2:
         print(USAGE, file=sys.stderr)
@@ -799,6 +964,8 @@ def main(argv: list) -> int:
         "snapshot": cmd_snapshot,
         "parse-response": cmd_parse_response,
         "round-write": cmd_round_write,
+        "summary": cmd_summary,
+        "consolidate-final": cmd_consolidate_final,
     }
     if cmd not in dispatcher:
         print(f"Unknown subcommand: {cmd}\n\n{USAGE}", file=sys.stderr)
