@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """3p — three-party review skill helper. Subcommand-based CLI."""
 import sys
+import contextlib
 import hashlib
 import json
 import re
 import subprocess as _sp
 from pathlib import Path
+
+try:
+    import fcntl  # POSIX
+    _IS_POSIX = True
+except ImportError:
+    _IS_POSIX = False
+    import msvcrt
 
 
 HARDCODED_SECRET_PATTERNS = [
@@ -91,6 +99,167 @@ def load_config(anchor: Path, config_path=None, cli_excludes=None) -> dict:
         if p not in cfg["secretPatterns"]:
             cfg["secretPatterns"].append(p)
     return cfg
+
+
+def find_anchor():
+    """Return (anchor_dir, is_git). Walks up to find .git, else CWD."""
+    cwd = Path.cwd()
+    cur = cwd
+    while cur != cur.parent:
+        if (cur / ".git").exists():
+            return cur, True
+        cur = cur.parent
+    return cwd, False
+
+
+def run_dir_path(anchor: Path, run_id: str) -> Path:
+    return anchor / ".3p" / run_id
+
+
+def atomic_write_json(path: Path, data: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
+
+
+def read_state(run_dir: Path) -> dict:
+    return json.loads((run_dir / "state.json").read_text())
+
+
+def write_state(run_dir: Path, state: dict) -> None:
+    atomic_write_json(run_dir / "state.json", state)
+
+
+@contextlib.contextmanager
+def state_lock(run_dir: Path):
+    lock_path = run_dir / ".state.lock"
+    lock_path.touch(exist_ok=True)
+    f = open(lock_path, "r+")
+    try:
+        if _IS_POSIX:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        else:
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        yield
+    finally:
+        if _IS_POSIX:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        else:
+            try:
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            except Exception:
+                pass
+        f.close()
+
+
+def mutate_state(run_dir: Path, mutator) -> None:
+    with state_lock(run_dir):
+        state = read_state(run_dir)
+        mutator(state)
+        write_state(run_dir, state)
+
+
+def append_availability_log(run_dir: Path, entry: dict) -> None:
+    def _mutator(state):
+        state.setdefault("availabilityLog", []).append(entry)
+    mutate_state(run_dir, _mutator)
+
+
+def cmd_init(args: list) -> int:
+    if len(args) < 2:
+        print("Usage: 3p.py init <slug> <timestamp> [--config <p>] [--exclude <pat>]...",
+              file=sys.stderr)
+        return 2
+    slug, ts = args[0], args[1]
+    config_path = None
+    cli_excludes = []
+    i = 2
+    while i < len(args):
+        if args[i] == "--config":
+            config_path = Path(args[i + 1])
+            i += 2
+        elif args[i] == "--exclude":
+            cli_excludes.append(args[i + 1])
+            i += 2
+        else:
+            print(f"Unknown flag: {args[i]}", file=sys.stderr)
+            return 2
+    run_id = f"{slug}-{ts}"
+    anchor, is_git = find_anchor()
+    if is_git:
+        verify_git_ref_format(f"refs/3p/{run_id}/pre-build")
+    run_dir = run_dir_path(anchor, run_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "baselines").mkdir(exist_ok=True)
+    resolved_cfg = load_config(anchor, config_path, cli_excludes)
+    state = {
+        "taskSlug": slug,
+        "taskDir": str(run_dir),
+        "repoRoot": str(anchor) if is_git else None,
+        "cwdAnchor": str(anchor) if not is_git else None,
+        "gitMode": is_git,
+        "phase": "plan",
+        "currentStep": None,
+        "currentScope": None,
+        "currentRound": 0,
+        "reviewerHealth": {
+            "codex": {"lastStatus": None, "consecutiveFailures": 0},
+            "gemini": {"lastStatus": None, "consecutiveFailures": 0},
+        },
+        "consecutiveBothDownRounds": 0,
+        "downgradeMode": None,
+        "baselines": {},
+        "pausedReason": None,
+        "resolvedConfig": resolved_cfg,
+        "availabilityLog": [],
+    }
+    write_state(run_dir, state)
+    if is_git:
+        gi = anchor / ".gitignore"
+        existing = gi.read_text() if gi.exists() else ""
+        if ".3p/" not in existing.splitlines():
+            sep = "" if existing.endswith("\n") or existing == "" else "\n"
+            gi.write_text(existing + sep + ".3p/\n")
+    print(run_id)
+    return 0
+
+
+def cmd_state_read(args: list) -> int:
+    if len(args) != 2:
+        print("Usage: 3p.py state-read <run-id> <key>", file=sys.stderr)
+        return 2
+    run_id, key = args
+    anchor, _ = find_anchor()
+    state = read_state(run_dir_path(anchor, run_id))
+    val = state.get(key)
+    if isinstance(val, (dict, list)):
+        print(json.dumps(val))
+    else:
+        print(val)
+    return 0
+
+
+def cmd_state_write(args: list) -> int:
+    if len(args) != 3:
+        print("Usage: 3p.py state-write <run-id> <key> <value-json>", file=sys.stderr)
+        return 2
+    run_id, key, value_json = args
+    value = json.loads(value_json)
+    anchor, _ = find_anchor()
+    run_dir = run_dir_path(anchor, run_id)
+    mutate_state(run_dir, lambda s: s.update({key: value}))
+    return 0
+
+
+def cmd_availability_append(args: list) -> int:
+    if len(args) != 2:
+        print("Usage: 3p.py availability-append <run-id> <entry-json>", file=sys.stderr)
+        return 2
+    run_id, entry_json = args
+    entry = json.loads(entry_json)
+    anchor, _ = find_anchor()
+    append_availability_log(run_dir_path(anchor, run_id), entry)
+    return 0
 
 
 def cmd_config_load(args: list) -> int:
@@ -189,6 +358,10 @@ def main(argv: list) -> int:
     dispatcher = {
         "slug": cmd_slug,
         "config-load": cmd_config_load,
+        "init": cmd_init,
+        "state-read": cmd_state_read,
+        "state-write": cmd_state_write,
+        "availability-append": cmd_availability_append,
     }
     if cmd not in dispatcher:
         print(f"Unknown subcommand: {cmd}\n\n{USAGE}", file=sys.stderr)
