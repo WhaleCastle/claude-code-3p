@@ -2,9 +2,12 @@
 """3p — three-party review skill helper. Subcommand-based CLI."""
 import sys
 import contextlib
+import fnmatch
 import hashlib
 import json
+import os
 import re
+import shutil
 import subprocess as _sp
 from pathlib import Path
 
@@ -349,6 +352,243 @@ def verify_git_ref_format(ref_path: str) -> None:
         )
 
 
+ALWAYS_EXCLUDED_DIRS = {".3p", ".git"}
+
+
+def pattern_matches(rel_path: str, pattern: str) -> bool:
+    """fnmatch-based matcher supporting trailing `/` for dir-only,
+    `**` for any depth, leading `/` for anchored-at-root."""
+    rel = rel_path.replace(os.sep, "/")
+    if pattern.startswith("/"):
+        anchored = True
+        pattern = pattern[1:]
+    else:
+        anchored = False
+    if pattern.endswith("/"):
+        p = pattern.rstrip("/")
+        if anchored:
+            return rel == p or rel.startswith(p + "/")
+        segments = rel.split("/")
+        if p in segments[:-1]:
+            return True
+        if rel == p or rel.startswith(p + "/"):
+            return True
+        return False
+    if "**" in pattern:
+        regex = fnmatch.translate(pattern)
+        return re.match(regex, rel) is not None
+    if anchored:
+        return fnmatch.fnmatch(rel, pattern)
+    base = rel.rsplit("/", 1)[-1]
+    return fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(base, pattern)
+
+
+def should_exclude(rel_path: str, patterns: list) -> bool:
+    return any(pattern_matches(rel_path, p) for p in patterns)
+
+
+def gitignore_rules(anchor: Path):
+    """Parse anchor `.gitignore` into ordered (negate, pattern) tuples.
+    Best-effort: handles comments, blanks, negations, trailing /."""
+    gi = anchor / ".gitignore"
+    if not gi.exists():
+        return []
+    rules = []
+    for line in gi.read_text().splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("!"):
+            rules.append((True, s[1:]))
+        else:
+            rules.append((False, s))
+    return rules
+
+
+def gitignore_excludes(rel_path: str, rules) -> bool:
+    """Apply ordered .gitignore rules; True if excluded."""
+    excluded = False
+    for negate, pattern in rules:
+        if pattern_matches(rel_path, pattern):
+            excluded = not negate
+    return excluded
+
+
+def enumerate_files_git(anchor: Path, user_excludes: list, secret_patterns: list):
+    result = _sp.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        cwd=anchor, capture_output=True, check=True,
+    )
+    paths = [p for p in result.stdout.decode("utf-8").split("\x00") if p]
+    out = []
+    for rel in paths:
+        top = rel.split("/", 1)[0]
+        if top in ALWAYS_EXCLUDED_DIRS:
+            continue
+        if should_exclude(rel, secret_patterns):
+            continue
+        if should_exclude(rel, user_excludes):
+            continue
+        out.append(rel)
+    return out
+
+
+def enumerate_files_nongit(anchor: Path, user_excludes: list,
+                           secret_patterns: list, gi_rules):
+    """Walk filtered by ALWAYS_EXCLUDED_DIRS; prune safely-excluded dirs
+    when no negation rule could match a descendant; collect-then-filter
+    per file so negations can re-include below pruned trees."""
+    negation_prefixes = [pat for negate, pat in gi_rules if negate]
+
+    def has_negation_descendant(rel_dir: str) -> bool:
+        prefix = rel_dir.rstrip("/") + "/"
+        for npat in negation_prefixes:
+            n = npat.lstrip("/").rstrip("/")
+            # exact dir match or a path under this dir
+            if n == rel_dir or n.startswith(prefix):
+                return True
+            # negation pattern itself starts with this dir (file inside)
+            if n.startswith(rel_dir + "/"):
+                return True
+            if "**" in npat:
+                return True
+        return False
+
+    candidates = []
+    for root, dirs, files in os.walk(anchor):
+        rel_root = os.path.relpath(root, anchor)
+        if rel_root == ".":
+            rel_root = ""
+        new_dirs = []
+        for d in dirs:
+            if d in ALWAYS_EXCLUDED_DIRS:
+                continue
+            rel_d = f"{rel_root}/{d}" if rel_root else d
+            positively_excluded = (
+                should_exclude(rel_d + "/", secret_patterns)
+                or should_exclude(rel_d + "/", user_excludes)
+                or any(
+                    pattern_matches(rel_d + "/", pat)
+                    for negate, pat in gi_rules if not negate
+                )
+            )
+            if positively_excluded and not has_negation_descendant(rel_d):
+                continue
+            new_dirs.append(d)
+        dirs[:] = new_dirs
+        for f in files:
+            rel = f"{rel_root}/{f}" if rel_root else f
+            candidates.append(rel)
+    out = []
+    for rel in candidates:
+        top = rel.split("/", 1)[0]
+        if top in ALWAYS_EXCLUDED_DIRS:
+            continue
+        if should_exclude(rel, secret_patterns):
+            continue
+        # Apply gitignore rules; if a negation explicitly re-includes this file,
+        # skip the user_excludes check so negations can override bloat defaults.
+        gi_excluded = False
+        gi_negated = False
+        for negate, pattern in gi_rules:
+            if pattern_matches(rel, pattern):
+                if negate:
+                    gi_negated = True
+                    gi_excluded = False
+                else:
+                    gi_negated = False
+                    gi_excluded = True
+        if gi_excluded:
+            continue
+        # Only apply user excludes when gitignore did NOT explicitly negate this file
+        if not gi_negated and should_exclude(rel, user_excludes):
+            continue
+        out.append(rel)
+    return out
+
+
+def enumerate_files(anchor: Path, user_excludes: list, secret_patterns: list,
+                    gi_rules, is_git: bool):
+    if is_git:
+        base = enumerate_files_git(anchor, user_excludes, secret_patterns)
+        if gi_rules:
+            base = [f for f in base if not gitignore_excludes(f, gi_rules)]
+        return base
+    return enumerate_files_nongit(anchor, user_excludes, secret_patterns, gi_rules)
+
+
+def cmd_snapshot(args: list) -> int:
+    if len(args) < 1:
+        print("Usage: 3p.py snapshot {capture|diff} ...", file=sys.stderr)
+        return 2
+    sub = args[0]
+    if sub == "capture":
+        return cmd_snapshot_capture(args[1:])
+    if sub == "diff":
+        print("Not yet implemented in Task 2.4", file=sys.stderr)
+        return 2
+    print(f"Unknown snapshot subcommand: {sub}", file=sys.stderr)
+    return 2
+
+
+def cmd_snapshot_capture(args: list) -> int:
+    if len(args) != 2:
+        print("Usage: 3p.py snapshot capture <run-id> <key>", file=sys.stderr)
+        return 2
+    run_id, key = args
+    anchor, is_git = find_anchor()
+    run_dir = run_dir_path(anchor, run_id)
+    state = read_state(run_dir)
+    cfg = state["resolvedConfig"]
+    gi_rules = gitignore_rules(anchor)
+    files = enumerate_files(
+        anchor, cfg["excludes"], cfg["secretPatterns"], gi_rules, is_git
+    )
+    snap_dir = run_dir / "baselines" / key
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    for rel in files:
+        src = anchor / rel
+        dst = snap_dir / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+    # Capture-time ignored paths (git mode only; honors full git ignore stack)
+    captured_ignored = []
+    if is_git:
+        try:
+            res = _sp.run(
+                ["git", "ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+                cwd=anchor, capture_output=True, check=True,
+            )
+            captured_ignored = [
+                p for p in res.stdout.decode("utf-8").split("\x00") if p
+            ]
+        except _sp.CalledProcessError:
+            captured_ignored = []
+    baseline_entry = {
+        "path": str(snap_dir),
+        "fileManifest": sorted(files),
+        "capturedGitignoreRules": [list(t) for t in gi_rules],
+        "capturedIgnoredPaths": sorted(captured_ignored),
+    }
+    if is_git:
+        ref = f"refs/3p/{run_id}/{key}"
+        verify_git_ref_format(ref)
+        try:
+            sha = _sp.run(["git", "stash", "create", "-u"], cwd=anchor,
+                          capture_output=True, text=True, check=True).stdout.strip()
+            if sha:
+                _sp.run(["git", "update-ref", ref, sha], cwd=anchor, check=True)
+                baseline_entry["gitSha"] = sha
+                baseline_entry["gitRef"] = ref
+        except _sp.CalledProcessError:
+            pass
+
+    def _mutator(s):
+        s["baselines"][key] = baseline_entry
+    mutate_state(run_dir, _mutator)
+    return 0
+
+
 def main(argv: list) -> int:
     if len(argv) < 2:
         print(USAGE, file=sys.stderr)
@@ -362,6 +602,7 @@ def main(argv: list) -> int:
         "state-read": cmd_state_read,
         "state-write": cmd_state_write,
         "availability-append": cmd_availability_append,
+        "snapshot": cmd_snapshot,
     }
     if cmd not in dispatcher:
         print(f"Unknown subcommand: {cmd}\n\n{USAGE}", file=sys.stderr)
