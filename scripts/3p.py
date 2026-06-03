@@ -709,6 +709,80 @@ def cmd_snapshot_capture(args: list) -> int:
     return 0
 
 
+def round_filename(phase: str, step: str, rnd: int, reviewer: str) -> str:
+    """Per-reviewer naming eliminates merge race."""
+    if phase == "plan":
+        return f"plan-round-{rnd}-{reviewer}.md"
+    if phase == "build":
+        return f"step-{step}-round-{rnd}-{reviewer}.md"
+    if phase == "final":
+        return f"final-round-{rnd}-{reviewer}.md"
+    raise ValueError(f"Unknown phase: {phase}")
+
+
+def render_reviewer_section(v: dict) -> str:
+    out = [f"## {v['reviewer']}", "", f"_Duration: {v.get('durationSeconds', 0)}s_", ""]
+    if v["status"] == "approved":
+        out.append("**APPROVED**")
+        out.append("")
+        return _append_rebuttals(out, v) if v.get("rebuttals") else "\n".join(out)
+    if v["status"] == "unavailable":
+        out.append("**UNAVAILABLE** (raw response below)")
+        out.append("")
+        out.append("```")
+        out.append(v.get("raw", "").strip())
+        out.append("```")
+        return "\n".join(out)
+    for f in v["findings"]:
+        out += [
+            f"### [{f['severity']}] {f['title']}",
+            f"- **Location:** {f['location']}",
+            f"- **Issue:** {f['issue']}",
+            f"- **Rationale:** {f['rationale']}",
+            f"- **Claude's verdict:** `{f['verdict']}` — {f['verdictReason']}",
+            "",
+        ]
+    return _append_rebuttals(out, v) if v.get("rebuttals") else "\n".join(out)
+
+
+def _append_rebuttals(out: list, v: dict) -> str:
+    if not v.get("rebuttals"):
+        return "\n".join(out)
+    out += ["### Rebuttal exchanges", ""]
+    for r in v["rebuttals"]:
+        out += [
+            f"- **From round {r['originalRound']}** — _{r['originalTitle']}_",
+            f"  - Claude's prior reason: {r['claudeReasonPrior']}",
+            f"  - Reviewer pushback: {r['reviewerPushback']}",
+            f"  - Claude's reconsideration: {r['claudeReasonNow']}",
+            f"  - Outcome: **{r['outcome']}**",
+            "",
+        ]
+    return "\n".join(out)
+
+
+def cmd_round_write(args: list) -> int:
+    if len(args) != 6:
+        print("Usage: 3p.py round-write <run-id> <phase> <step|-> <round> <reviewer> <verdicts-json>",
+              file=sys.stderr)
+        return 2
+    run_id, phase, step, rnd_s, reviewer, verdicts_json = args
+    rnd = int(rnd_s)
+    v = json.loads(verdicts_json)
+    assert v["reviewer"] == reviewer
+    anchor, _ = find_anchor()
+    run_dir = run_dir_path(anchor, run_id)
+    path = run_dir / round_filename(phase, step, rnd, reviewer)
+    header = (
+        f"# {phase.title()} round {rnd}"
+        + (f" — step {step}" if phase == "build" else "")
+        + f" ({reviewer})\n"
+    )
+    section = render_reviewer_section(v)
+    path.write_text(header + "\n" + section + "\n")
+    return 0
+
+
 def main(argv: list) -> int:
     if len(argv) < 2:
         print(USAGE, file=sys.stderr)
@@ -724,6 +798,7 @@ def main(argv: list) -> int:
         "availability-append": cmd_availability_append,
         "snapshot": cmd_snapshot,
         "parse-response": cmd_parse_response,
+        "round-write": cmd_round_write,
     }
     if cmd not in dispatcher:
         print(f"Unknown subcommand: {cmd}\n\n{USAGE}", file=sys.stderr)
