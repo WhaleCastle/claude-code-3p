@@ -517,6 +517,46 @@ def enumerate_files(anchor: Path, user_excludes: list, secret_patterns: list,
     return enumerate_files_nongit(anchor, user_excludes, secret_patterns, gi_rules)
 
 
+_FINDING_HEADER = re.compile(r"^\[(Blocker|Critical|Important|Risk)\]\s+(.+?)\s*$", re.M)
+
+
+def _extract_field(block: str, name: str) -> str:
+    m = re.search(rf"^{name}:\s*(.+?)(?:\n[A-Z][a-z]+:|\Z)", block, re.M | re.S)
+    return m.group(1).strip() if m else ""
+
+
+def parse_response(text: str) -> dict:
+    findings = []
+    matches = list(_FINDING_HEADER.finditer(text))
+    for i, m in enumerate(matches):
+        severity = m.group(1)
+        title = m.group(2).strip()
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        block = text[start:end]
+        findings.append({
+            "severity": severity,
+            "title": title,
+            "location": _extract_field(block, "Location"),
+            "issue": _extract_field(block, "Issue"),
+            "rationale": _extract_field(block, "Rationale"),
+        })
+    if findings:
+        return {"status": "findings", "findings": findings}
+    if re.search(r"^APPROVED\s*$", text, re.M):
+        return {"status": "approved", "findings": []}
+    return {"status": "unavailable", "raw": text, "findings": []}
+
+
+def cmd_parse_response(args: list) -> int:
+    if len(args) != 1:
+        print("Usage: 3p.py parse-response <file>", file=sys.stderr)
+        return 2
+    text = Path(args[0]).read_text()
+    print(json.dumps(parse_response(text), indent=2))
+    return 0
+
+
 def cmd_snapshot(args: list) -> int:
     if len(args) < 1:
         print("Usage: 3p.py snapshot {capture|diff} ...", file=sys.stderr)
@@ -683,6 +723,7 @@ def main(argv: list) -> int:
         "state-write": cmd_state_write,
         "availability-append": cmd_availability_append,
         "snapshot": cmd_snapshot,
+        "parse-response": cmd_parse_response,
     }
     if cmd not in dispatcher:
         print(f"Unknown subcommand: {cmd}\n\n{USAGE}", file=sys.stderr)
