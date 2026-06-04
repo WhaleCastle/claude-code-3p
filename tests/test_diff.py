@@ -113,3 +113,39 @@ def test_diff_excludes_bloat_dirs(script_path, tmp_git_repo):
     (tmp_git_repo / "node_modules" / "huge.js").write_text("// huge\n")
     r = run_3p(script_path, tmp_git_repo, "snapshot", "diff", "x-20260603-1430", "step-1")
     assert "node_modules" not in r.stdout
+
+
+def test_diff_honors_captured_info_exclude_for_new_files(script_path, tmp_git_repo):
+    """Spec: live-side diff must honor captured-time .git/info/exclude rules.
+    A file added to info/exclude AND created after baseline must NOT appear in diff."""
+    (tmp_git_repo / "a.py").write_text("ok\n")
+    info_exclude = tmp_git_repo / ".git" / "info" / "exclude"
+    info_exclude.parent.mkdir(parents=True, exist_ok=True)
+    info_exclude.write_text("local-only.txt\n")
+    run_3p(script_path, tmp_git_repo, "init", "x", "20260603-1430")
+    run_3p(script_path, tmp_git_repo, "snapshot", "capture", "x-20260603-1430", "step-1")
+    # File didn't exist at capture; gets created mid-task; should be excluded by frozen info/exclude
+    (tmp_git_repo / "local-only.txt").write_text("LAPTOP-SECRET-CONFIG=xyz\n")
+    r = run_3p(script_path, tmp_git_repo, "snapshot", "diff", "x-20260603-1430", "step-1")
+    assert r.returncode == 0, r.stderr
+    assert "LAPTOP-SECRET-CONFIG" not in r.stdout, \
+        ".git/info/exclude rule must keep this file out of the diff"
+
+
+def test_diff_honors_captured_nested_gitignore(script_path, tmp_git_repo):
+    """Nested .gitignore at pkg/foo/.gitignore should exclude pkg/foo/build/* even
+    for files created after baseline."""
+    import subprocess
+    (tmp_git_repo / "pkg" / "foo").mkdir(parents=True)
+    (tmp_git_repo / "pkg" / "foo" / ".gitignore").write_text("build/\n")
+    (tmp_git_repo / "pkg" / "foo" / "src.py").write_text("ok\n")
+    # Capture baseline now
+    run_3p(script_path, tmp_git_repo, "init", "x", "20260603-1430")
+    run_3p(script_path, tmp_git_repo, "snapshot", "capture", "x-20260603-1430", "step-1")
+    # Mid-task: create files under pkg/foo/build/ — frozen nested rule should exclude
+    (tmp_git_repo / "pkg" / "foo" / "build").mkdir()
+    (tmp_git_repo / "pkg" / "foo" / "build" / "output.bin").write_text("BUILD-ARTIFACT\n")
+    r = run_3p(script_path, tmp_git_repo, "snapshot", "diff", "x-20260603-1430", "step-1")
+    assert r.returncode == 0, r.stderr
+    assert "BUILD-ARTIFACT" not in r.stdout, \
+        "Nested .gitignore must keep pkg/foo/build/output.bin out of the diff"

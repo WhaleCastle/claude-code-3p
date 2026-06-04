@@ -413,6 +413,112 @@ def should_exclude(rel_path: str, patterns: list) -> bool:
     return any(pattern_matches(rel_path, p) for p in patterns)
 
 
+def collect_gitignore_sources(anchor: Path, is_git: bool) -> list:
+    """Collect all gitignore-format ignore sources at capture time:
+    - Every `.gitignore` in the working tree (scoped to their containing dir)
+    - `.git/info/exclude` (repo-scoped)
+    - Global `core.excludesFile` (repo-scoped)
+
+    Each entry: `{kind: "gitignore"|"info-exclude"|"global", dir: "<scope-dir-or-empty>", content: <text>}`.
+
+    The `dir` field is the path RELATIVE TO ANCHOR where the source's patterns apply
+    (empty string = repo-wide). Diff-time logic uses this to scope nested rules
+    correctly: a nested `.gitignore` at `pkg/foo/.gitignore` only applies to paths
+    under `pkg/foo/`.
+    """
+    if not is_git:
+        return []
+    sources = []
+    # Every nested .gitignore in the tree
+    for root, dirs, files in os.walk(anchor):
+        # Skip .git and .3p — never recurse into them
+        if ".git" in dirs:
+            dirs.remove(".git")
+        if ".3p" in dirs:
+            dirs.remove(".3p")
+        for f in files:
+            if f == ".gitignore":
+                rel_dir = os.path.relpath(root, anchor)
+                full = Path(root) / f
+                try:
+                    sources.append({
+                        "kind": "gitignore",
+                        "dir": "" if rel_dir == "." else rel_dir.replace(os.sep, "/"),
+                        "content": full.read_text(),
+                    })
+                except OSError:
+                    pass
+    # .git/info/exclude
+    info_exclude = anchor / ".git" / "info" / "exclude"
+    if info_exclude.exists():
+        try:
+            sources.append({
+                "kind": "info-exclude",
+                "dir": "",
+                "content": info_exclude.read_text(),
+            })
+        except OSError:
+            pass
+    # Global excludesFile (from `git config core.excludesFile`)
+    try:
+        r = _sp.run(
+            ["git", "config", "--get", "core.excludesFile"],
+            cwd=anchor, capture_output=True, text=True,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            global_path = Path(os.path.expanduser(r.stdout.strip()))
+            if global_path.exists():
+                sources.append({
+                    "kind": "global",
+                    "dir": "",
+                    "content": global_path.read_text(),
+                })
+    except (OSError, _sp.CalledProcessError):
+        pass
+    return sources
+
+
+def _parse_source_rules(content: str) -> list:
+    """Parse gitignore-format content into ordered (negate, pattern) tuples.
+    Same syntax as `gitignore_rules`, just from arbitrary content text."""
+    rules = []
+    for line in content.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("!"):
+            rules.append((True, s[1:]))
+        else:
+            rules.append((False, s))
+    return rules
+
+
+def rel_path_excluded_by_sources(rel_path: str, sources: list) -> bool:
+    """Apply each captured ignore source to rel_path with directory scoping.
+
+    For each source, if `dir` is non-empty, the source applies ONLY to paths
+    at or below that directory. The path is matched against the source's
+    patterns relative to that directory. Returns True if any rule excludes
+    the path (last-match-wins within a source; later sources override earlier
+    ones for the same path).
+    """
+    rel = rel_path.replace(os.sep, "/")
+    excluded = False
+    for src in sources:
+        src_dir = src.get("dir", "")
+        if src_dir:
+            scope_prefix = src_dir.rstrip("/") + "/"
+            if not (rel == src_dir or rel.startswith(scope_prefix)):
+                continue
+            scoped_rel = rel[len(scope_prefix):] if rel.startswith(scope_prefix) else rel
+        else:
+            scoped_rel = rel
+        for negate, pattern in _parse_source_rules(src["content"]):
+            if pattern_matches(scoped_rel, pattern):
+                excluded = not negate
+    return excluded
+
+
 def gitignore_rules(anchor: Path):
     """Parse anchor `.gitignore` into ordered (negate, pattern) tuples.
     Best-effort: handles comments, blanks, negations, trailing /."""
@@ -635,6 +741,14 @@ def cmd_snapshot_diff(args: list) -> int:
     captured_ignored = set(baseline_meta.get("capturedIgnoredPaths", []))
     if captured_ignored:
         live_files -= captured_ignored
+    # Apply captured-time non-root ignore sources (nested .gitignore, .git/info/exclude,
+    # global excludesFile) so newly-created files matching those frozen rules stay out
+    # of the live side. This restores full ignore-stack symmetry that root-only
+    # capturedGitignoreRules cannot provide.
+    captured_sources = baseline_meta.get("capturedIgnoreSources", [])
+    if captured_sources:
+        live_files = {f for f in live_files
+                      if not rel_path_excluded_by_sources(f, captured_sources)}
     snap_files = {p for p in snap_files
                   if not should_exclude(p, cfg["secretPatterns"])}
     union = sorted(snap_files | live_files)
@@ -767,6 +881,7 @@ def cmd_snapshot_capture(args: list) -> int:
         "fileManifest": sorted(files),
         "capturedGitignoreRules": [list(t) for t in gi_rules],
         "capturedIgnoredPaths": sorted(captured_ignored),
+        "capturedIgnoreSources": collect_gitignore_sources(anchor, is_git),  # NEW
     }
     if is_git:
         ref = f"refs/3p/{run_id}/{key}"
