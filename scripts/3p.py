@@ -642,6 +642,10 @@ def cmd_snapshot_diff(args: list) -> int:
         snap_exists = snap_file.exists()
         live_exists = live_file.exists()
         if snap_exists and live_exists:
+            # Quick equality check to avoid spawning diff for unchanged files.
+            if snap_file.stat().st_size == live_file.stat().st_size:
+                if snap_file.read_bytes() == live_file.read_bytes():
+                    continue  # identical, skip diff entirely
             r = _sp.run(["diff", "-u", str(snap_file), str(live_file)],
                         capture_output=True, text=True)
             if r.stdout:
