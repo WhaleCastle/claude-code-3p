@@ -543,7 +543,10 @@ def enumerate_files(anchor: Path, user_excludes: list, secret_patterns: list,
     return enumerate_files_nongit(anchor, user_excludes, secret_patterns, gi_rules)
 
 
-_FINDING_HEADER = re.compile(r"^\[(Blocker|Critical|Important|Risk)\]\s+(.+?)\s*$", re.M)
+_FINDING_HEADER = re.compile(
+    r"^\s*\*{0,2}\[(Blocker|Critical|Important|Risk)\]\*{0,2}\s+(.+?)\s*$",
+    re.M,
+)
 
 
 def _extract_field(block: str, name: str) -> str:

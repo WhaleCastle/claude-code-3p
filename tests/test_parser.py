@@ -61,3 +61,20 @@ def test_garbled_unavailable(script_path, tmp_path):
     out = parse(script_path, "ramble ramble nothing structured\n", tmp_path)
     assert out["status"] == "unavailable"
     assert "raw" in out
+
+
+def test_parser_tolerates_markdown_bold(script_path, tmp_path):
+    out = parse(script_path, "**[Critical]** something\nLocation: x\nIssue: y\nRationale: z\n", tmp_path)
+    assert out["status"] == "findings"
+    assert len(out["findings"]) == 1
+    assert out["findings"][0]["severity"] == "Critical"
+    assert out["findings"][0]["title"] == "something"
+
+
+def test_parser_tolerates_markdown_bold_no_title_space(script_path, tmp_path):
+    """**[Important]** with multi-word title."""
+    content = "**[Important]** Missing null check\nLocation: foo.py\nIssue: crash\nRationale: test\n"
+    out = parse(script_path, content, tmp_path)
+    assert out["status"] == "findings"
+    assert out["findings"][0]["severity"] == "Important"
+    assert out["findings"][0]["title"] == "Missing null check"
