@@ -149,3 +149,25 @@ def test_diff_honors_captured_nested_gitignore(script_path, tmp_git_repo):
     assert r.returncode == 0, r.stderr
     assert "BUILD-ARTIFACT" not in r.stdout, \
         "Nested .gitignore must keep pkg/foo/build/output.bin out of the diff"
+
+
+def test_diff_honors_relative_core_excludesfile(script_path, tmp_git_repo):
+    """Spec: relative core.excludesFile paths must be resolved against the
+    repo anchor, not the process CWD, so the global excludes source is
+    captured correctly regardless of where the user invoked from."""
+    import subprocess
+    # Set a RELATIVE core.excludesFile that lives at the repo root
+    (tmp_git_repo / ".local-ignore").write_text("notes-*.txt\n")
+    subprocess.run(["git", "config", "core.excludesFile", ".local-ignore"],
+                   cwd=tmp_git_repo, check=True)
+    (tmp_git_repo / "src.py").write_text("ok\n")
+    run_3p(script_path, tmp_git_repo, "init", "x", "20260603-1430")
+    run_3p(script_path, tmp_git_repo, "snapshot", "capture",
+           "x-20260603-1430", "step-1")
+    # Mid-task: create a file matching the relative excludesFile rule
+    (tmp_git_repo / "notes-private.txt").write_text("LOCAL-NOTES-CONTENT=foo\n")
+    r = run_3p(script_path, tmp_git_repo, "snapshot", "diff",
+               "x-20260603-1430", "step-1")
+    assert r.returncode == 0, r.stderr
+    assert "LOCAL-NOTES-CONTENT" not in r.stdout, \
+        "Relative core.excludesFile rule must exclude this file from the diff"

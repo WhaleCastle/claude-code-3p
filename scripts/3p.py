@@ -466,7 +466,11 @@ def collect_gitignore_sources(anchor: Path, is_git: bool) -> list:
             cwd=anchor, capture_output=True, text=True,
         )
         if r.returncode == 0 and r.stdout.strip():
-            global_path = Path(os.path.expanduser(r.stdout.strip()))
+            raw = os.path.expanduser(r.stdout.strip())
+            # Git accepts relative paths for core.excludesFile; resolve them
+            # against the repo anchor (not the process CWD) so the source is
+            # captured correctly regardless of where the user invoked from.
+            global_path = Path(raw) if os.path.isabs(raw) else (anchor / raw)
             if global_path.exists():
                 sources.append({
                     "kind": "global",
