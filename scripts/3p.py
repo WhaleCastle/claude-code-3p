@@ -375,6 +375,12 @@ def pattern_matches(rel_path: str, pattern: str) -> bool:
             return True
         return False
     if "**" in pattern:
+        # Also test the bare suffix (after "**/") at root level so that
+        # e.g. "**/.aws/credentials" matches the root-level ".aws/credentials".
+        if pattern.startswith("**/"):
+            suffix = pattern[3:]
+            if pattern_matches(rel_path, suffix):
+                return True
         regex = fnmatch.translate(pattern)
         return re.match(regex, rel) is not None
     if anchored:

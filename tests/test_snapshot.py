@@ -106,6 +106,23 @@ def test_snapshot_uses_resolved_config_not_cli(script_path, tmp_git_repo):
     assert not (snap / "data").exists()
 
 
+def test_snapshot_excludes_root_level_starstar_secrets(script_path, tmp_git_repo):
+    """Spec-mandated: **/.aws/credentials must catch root-level .aws/credentials.
+    Same for **/credentials.json and **/.aws/config."""
+    (tmp_git_repo / ".aws").mkdir()
+    (tmp_git_repo / ".aws" / "credentials").write_text("AKIA...")
+    (tmp_git_repo / ".aws" / "config").write_text("[default]")
+    (tmp_git_repo / "credentials.json").write_text('{"key":"secret"}')
+    (tmp_git_repo / "src.py").write_text("ok")
+    run_3p(script_path, tmp_git_repo, "init", "x", "20260603-1430")
+    run_3p(script_path, tmp_git_repo, "snapshot", "capture", "x-20260603-1430", "pre-build")
+    snap = tmp_git_repo / ".3p" / "x-20260603-1430" / "baselines" / "pre-build"
+    assert (snap / "src.py").exists()
+    assert not (snap / ".aws" / "credentials").exists()
+    assert not (snap / ".aws" / "config").exists()
+    assert not (snap / "credentials.json").exists()
+
+
 def test_gitignore_negation_re_includes(script_path, tmp_non_git):
     setup_repo_with_files(tmp_non_git, **{
         "build/keep.txt": "keep",
