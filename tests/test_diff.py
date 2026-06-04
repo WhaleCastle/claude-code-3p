@@ -58,6 +58,35 @@ def test_diff_includes_new_file_added_to_gitignore_mid_run(script_path, tmp_git_
     assert "important new content" in r.stdout
 
 
+def test_diff_handles_spaces_in_filenames(script_path, tmp_git_repo):
+    """Diff parser must handle file paths containing spaces."""
+    (tmp_git_repo / "my file.py").write_text("# v1\n")
+    run_3p(script_path, tmp_git_repo, "init", "x", "20260603-1430")
+    run_3p(script_path, tmp_git_repo, "snapshot", "capture", "x-20260603-1430", "step-1")
+    (tmp_git_repo / "my file.py").write_text("# v2\n")
+    r = run_3p(script_path, tmp_git_repo, "snapshot", "diff", "x-20260603-1430", "step-1")
+    assert "my file.py" in r.stdout
+    assert "v1" in r.stdout
+    assert "v2" in r.stdout
+
+
+def test_diff_summary_handles_spaces_in_filenames(script_path, tmp_git_repo):
+    """_parse_diff_header_paths (used by summary) must use rfind so it picks the
+    correct split when the filename itself contains the anchor base string."""
+    import importlib.util, os as _os
+    spec = importlib.util.spec_from_file_location("threep", str(script_path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    # Construct a rest-string where find() would pick the wrong split
+    snap_str = "/snap"
+    anchor_str = "/anc"
+    # filename "x /anc/y.py" contains " /anc/" — find() hits that first
+    rest = "/snap/x /anc/y.py /anc/x /anc/y.py"
+    result = mod._parse_diff_header_paths(rest, snap_str, anchor_str)
+    expected = _os.path.join("x /anc", "y.py")
+    assert result == expected, f"rfind fix needed: got {result!r}, want {expected!r}"
+
+
 def test_diff_excludes_bloat_dirs(script_path, tmp_git_repo):
     (tmp_git_repo / "a.py").write_text("ok\n")
     run_3p(script_path, tmp_git_repo, "init", "x", "20260603-1430")

@@ -669,18 +669,38 @@ def cmd_snapshot_diff(args: list) -> int:
 
 def _parse_diff_header_paths(rest: str, snap_str: str, anchor_str: str) -> str:
     """Extract relative path from a 'diff -ruN PATH_A PATH_B' line,
-    robust to spaces. PATH_A starts with snap_str or anchor_str."""
+    robust to spaces. PATH_A starts with snap_str or anchor_str.
+
+    Strategy: since we KNOW both paths mirror the same relative path, they are
+    structured as '<base_a>/<rel> <base_b>/<rel>'. We find the unique space
+    that acts as separator by scanning for all occurrences of ' <base_b>' and
+    choosing the one where rest[idx+1:] is exactly '<base_b>/<same_rel>'.
+    """
     for base_a in (snap_str, anchor_str):
-        if rest.startswith(base_a + os.sep):
-            other = anchor_str if base_a == snap_str else snap_str
-            needle = " " + other + os.sep
-            idx = rest.find(needle)
-            if idx != -1:
-                return os.path.relpath(rest[:idx], base_a)
-            needle2 = " " + other
-            idx2 = rest.find(needle2)
-            if idx2 != -1:
-                return os.path.relpath(rest[:idx2], base_a)
+        if not rest.startswith(base_a + os.sep) and not rest.startswith(base_a + " "):
+            continue
+        if not rest.startswith(base_a):
+            continue
+        other = anchor_str if base_a == snap_str else snap_str
+        needle = " " + other
+        # Walk all occurrences of needle; for each, check that the remainder
+        # starts with other + os.sep (or is exactly other) and that the
+        # relative tails are equal — this pins the correct split.
+        start = 0
+        while True:
+            idx = rest.find(needle, start)
+            if idx == -1:
+                break
+            path_a = rest[:idx]
+            path_b = rest[idx + 1:]
+            # path_b must start with other followed by a separator or end
+            if path_b == other or path_b.startswith(other + os.sep):
+                rel_a = os.path.relpath(path_a, base_a)
+                rel_b = os.path.relpath(path_b, other)
+                # The two relative paths must agree (mirrored layout)
+                if rel_a == rel_b:
+                    return rel_a
+            start = idx + 1
     return ""
 
 
