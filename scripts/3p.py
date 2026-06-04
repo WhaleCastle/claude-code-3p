@@ -623,8 +623,11 @@ def cmd_snapshot_diff(args: list) -> int:
         gi_rules = captured_gi
     else:
         gi_rules = gitignore_rules(anchor)
-    live_files = set(enumerate_files(
-        anchor, cfg["excludes"], cfg["secretPatterns"], gi_rules, is_git
+    # Use nongit filesystem walk for the live side so that mid-task .gitignore
+    # changes don't silently drop newly-created files. Captured rules give
+    # symmetric filtering against snapshot-time state.
+    live_files = set(enumerate_files_nongit(
+        anchor, cfg["excludes"], cfg["secretPatterns"], gi_rules
     ))
     captured_ignored = set(baseline_meta.get("capturedIgnoredPaths", []))
     if captured_ignored:

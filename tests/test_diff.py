@@ -41,6 +41,23 @@ def test_diff_excludes_secrets_even_if_they_appear(script_path, tmp_git_repo):
     assert ".env" not in r.stdout
 
 
+def test_diff_includes_new_file_added_to_gitignore_mid_run(script_path, tmp_git_repo):
+    """Even if a task adds new.txt to .gitignore, a new.txt CREATED after baseline
+    must still appear in the reviewer diff (spec: symmetric filtering against
+    CAPTURE-TIME rules, not current rules)."""
+    (tmp_git_repo / "a.py").write_text("# a\n")
+    (tmp_git_repo / ".gitignore").write_text("# initial\n")
+    run_3p(script_path, tmp_git_repo, "init", "x", "20260603-1430")
+    run_3p(script_path, tmp_git_repo, "snapshot", "capture", "x-20260603-1430", "step-1")
+    # Mid-task: task modifies .gitignore to ignore new.txt, then creates new.txt
+    (tmp_git_repo / ".gitignore").write_text("# updated\nnew.txt\n")
+    (tmp_git_repo / "new.txt").write_text("important new content\n")
+    r = run_3p(script_path, tmp_git_repo, "snapshot", "diff", "x-20260603-1430", "step-1")
+    assert r.returncode == 0, r.stderr
+    assert "new.txt" in r.stdout, "new.txt must appear in diff (capture-time rules didn't exclude it)"
+    assert "important new content" in r.stdout
+
+
 def test_diff_excludes_bloat_dirs(script_path, tmp_git_repo):
     (tmp_git_repo / "a.py").write_text("ok\n")
     run_3p(script_path, tmp_git_repo, "init", "x", "20260603-1430")
