@@ -24,3 +24,19 @@ def test_clean_removes_run_dir(script_path, tmp_git_repo):
     r = run_3p(script_path, tmp_git_repo, "clean", "a-20260603-1430")
     assert r.returncode == 0
     assert not run_dir.exists()
+
+
+def test_clean_rejects_path_traversal(script_path, tmp_git_repo):
+    """run-id with .. or / must be rejected before shutil.rmtree."""
+    victim_dir = tmp_git_repo.parent / "victim"
+    victim_dir.mkdir(exist_ok=True)
+    (victim_dir / "important.txt").write_text("do not delete")
+    r = run_3p(script_path, tmp_git_repo, "clean", "../../victim")
+    assert r.returncode != 0, f"Should reject path traversal; got: {r.stdout!r} {r.stderr!r}"
+    assert victim_dir.exists()
+    assert (victim_dir / "important.txt").exists()
+
+
+def test_clean_rejects_malformed_run_id(script_path, tmp_git_repo):
+    r = run_3p(script_path, tmp_git_repo, "clean", "not-a-real-runid")
+    assert r.returncode != 0

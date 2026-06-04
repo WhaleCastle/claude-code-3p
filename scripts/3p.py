@@ -18,6 +18,19 @@ except ImportError:
     _IS_POSIX = False
     import msvcrt
 
+import re as _re_validation
+
+_RUN_ID_RE = _re_validation.compile(r"^[a-z0-9][a-z0-9-]*-\d{8}-\d{4}$")
+
+
+def validate_run_id(run_id: str) -> None:
+    """Reject anything that isn't a well-formed run id to prevent path traversal."""
+    if not _RUN_ID_RE.match(run_id):
+        raise SystemExit(
+            f"Invalid run_id: {run_id!r}. Expected format: <slug>-<YYYYMMDD>-<HHMM> "
+            f"where slug uses only [a-z0-9-]."
+        )
+
 
 HARDCODED_SECRET_PATTERNS = [
     ".env",
@@ -116,6 +129,13 @@ def find_anchor():
 
 
 def run_dir_path(anchor: Path, run_id: str) -> Path:
+    validate_run_id(run_id)
+    base = (anchor / ".3p").resolve()
+    candidate = (anchor / ".3p" / run_id).resolve()
+    if candidate != base and base not in candidate.parents:
+        raise SystemExit(
+            f"run_id {run_id!r} resolves outside the .3p/ directory. Aborting."
+        )
     return anchor / ".3p" / run_id
 
 
