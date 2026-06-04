@@ -663,6 +663,28 @@ def cmd_snapshot_diff(args: list) -> int:
             out_lines.append(f"Only in {snap_path}: {rel}\n")
             if r.stdout:
                 out_lines.append(r.stdout)
+    # Enumerate live-tree paths that matched secret patterns and were excluded.
+    # Warn so the user knows what was silently dropped from the diff.
+    dropped_secrets = []
+    for root, dirs, files in os.walk(anchor):
+        rel_root = os.path.relpath(root, anchor)
+        if rel_root == ".":
+            rel_root = ""
+        dirs[:] = [d for d in dirs if d not in ALWAYS_EXCLUDED_DIRS]
+        for f in files:
+            rel = f"{rel_root}/{f}" if rel_root else f
+            if should_exclude(rel, cfg["secretPatterns"]):
+                dropped_secrets.append(rel)
+    dropped_secrets = sorted(set(dropped_secrets))
+    if dropped_secrets:
+        out_lines.append("\n# ============================================================\n")
+        out_lines.append("# WARNING: the following paths matched hardcoded secret patterns\n")
+        out_lines.append("# and were excluded from this diff. If these are legitimate files\n")
+        out_lines.append("# you want reviewers to see, the secret-pattern list cannot be\n")
+        out_lines.append("# disabled — consider renaming the files instead.\n")
+        out_lines.append("# ============================================================\n")
+        for p in dropped_secrets:
+            out_lines.append(f"# skipped (secret pattern match): {p}\n")
     sys.stdout.write("".join(out_lines))
     return 0
 

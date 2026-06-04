@@ -31,14 +31,18 @@ def test_diff_shows_new_files(script_path, tmp_git_repo):
 
 
 def test_diff_excludes_secrets_even_if_they_appear(script_path, tmp_git_repo):
-    """Secret files appearing in live tree but not snapshot must not show up."""
+    """Secret files appearing in live tree must not have their content in the diff.
+    The filename may appear in the WARNING comment block (that is spec-compliant)."""
     (tmp_git_repo / "a.py").write_text("ok\n")
     run_3p(script_path, tmp_git_repo, "init", "x", "20260603-1430")
     run_3p(script_path, tmp_git_repo, "snapshot", "capture", "x-20260603-1430", "step-1")
     (tmp_git_repo / ".env").write_text("SECRET=hunter2\n")
     r = run_3p(script_path, tmp_git_repo, "snapshot", "diff", "x-20260603-1430", "step-1")
     assert "SECRET=hunter2" not in r.stdout
-    assert ".env" not in r.stdout
+    # .env content must not appear in any diff hunk (only in comment lines is OK)
+    for line in r.stdout.splitlines():
+        if not line.startswith("#"):
+            assert ".env" not in line, f"secret filename leaked into diff hunk: {line!r}"
 
 
 def test_diff_includes_new_file_added_to_gitignore_mid_run(script_path, tmp_git_repo):
@@ -85,6 +89,20 @@ def test_diff_summary_handles_spaces_in_filenames(script_path, tmp_git_repo):
     result = mod._parse_diff_header_paths(rest, snap_str, anchor_str)
     expected = _os.path.join("x /anc", "y.py")
     assert result == expected, f"rfind fix needed: got {result!r}, want {expected!r}"
+
+
+def test_diff_warns_about_dropped_secret_files(script_path, tmp_git_repo):
+    """Spec: skipped secrets get a warning so the user knows what was excluded."""
+    (tmp_git_repo / "a.py").write_text("ok\n")
+    (tmp_git_repo / ".env").write_text("SECRET=hunter2\n")
+    run_3p(script_path, tmp_git_repo, "init", "x", "20260603-1430")
+    run_3p(script_path, tmp_git_repo, "snapshot", "capture", "x-20260603-1430", "step-1")
+    (tmp_git_repo / ".env").write_text("SECRET=changed\n")
+    r = run_3p(script_path, tmp_git_repo, "snapshot", "diff", "x-20260603-1430", "step-1")
+    assert "hunter2" not in r.stdout
+    assert "changed" not in r.stdout
+    assert ("secret pattern match" in r.stdout.lower() or "WARNING" in r.stdout)
+    assert ".env" in r.stdout
 
 
 def test_diff_excludes_bloat_dirs(script_path, tmp_git_repo):
