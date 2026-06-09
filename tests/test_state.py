@@ -4,10 +4,10 @@ import sys
 from pathlib import Path
 
 
-def run_3p(script_path: Path, cwd: Path, *args):
+def run_3p(script_path: Path, cwd: Path, *args, env=None):
     return subprocess.run(
         [sys.executable, str(script_path), *args],
-        capture_output=True, text=True, cwd=cwd,
+        capture_output=True, text=True, cwd=cwd, env=env,
     )
 
 
@@ -35,6 +35,22 @@ def test_init_persists_cli_config_flags(script_path, tmp_git_repo):
     assert "secret_dir/" in state["resolvedConfig"]["excludes"]
     assert "data/" in state["resolvedConfig"]["excludes"]
     assert "node_modules/" in state["resolvedConfig"]["excludes"]
+
+
+def test_init_persists_model_power_and_reviewer_role(script_path, tmp_git_repo, tmp_path):
+    run_3p(script_path, tmp_git_repo, "model-power", "low")
+    r = run_3p(script_path, tmp_git_repo, "init", "x", "20260603-1430")
+    assert r.returncode == 0, r.stderr
+    state = json.loads((tmp_git_repo / ".3p" / "x-20260603-1430" / "state.json").read_text())
+    assert state["resolvedConfig"]["modelPower"] == "low"
+    fake_home = tmp_path / "home"
+    env = {"HOME": str(fake_home), "PATH": "/usr/bin:/bin"}
+    role = run_3p(script_path, tmp_git_repo, "reviewer-role", "x-20260603-1430", "gemini", env=env)
+    assert role.returncode == 0, role.stderr
+    role_name = role.stdout.strip()
+    assert role_name.startswith("codereviewer-low-")
+    gemini_pal = json.loads((fake_home / ".pal" / "cli_clients" / "gemini.json").read_text())
+    assert gemini_pal["roles"][role_name]["role_args"] == ["--model", "flash"]
 
 
 def test_init_bootstraps_gitignore(script_path, tmp_git_repo):

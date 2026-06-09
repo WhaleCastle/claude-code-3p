@@ -4,6 +4,20 @@ A Claude Code skill that runs a **Plan → Build → Review** workflow with **Co
 
 ---
 
+## Should you use this?
+
+Use `3p` when a change is important enough to justify independent model review: security-sensitive edits, refactors across several files, architecture changes, migrations, or work where a second and third model may catch plan drift or subtle regressions. It gives you:
+
+- A structured plan/build/final-review loop inside Claude Code.
+- Parallel Codex and Gemini reviewer calls through PAL MCP.
+- Configurable reviewer model power (`high` or `low`) with per-project overrides.
+- Persistent artifacts under `.3p/<run-id>/` for every plan, review round, verdict, and final summary.
+- Hard safety rails: no commits, pushes, deploys, or secret-pattern files in reviewer prompts.
+
+Do not use it for tiny edits where the review overhead is larger than the task. It also is not standalone: you need Claude Code, PAL MCP, Codex CLI, and Gemini CLI configured locally.
+
+---
+
 ## For Claude Code: install this skill
 
 > If you (Claude) were given this repository URL by a user and asked to install this skill, follow these steps **exactly**. Do not skip the verification step.
@@ -25,7 +39,7 @@ python3 ~/.claude/skills/3p/scripts/3p.py
 #    on the first reviewer call. Confirm with the user before claiming install is complete.
 ```
 
-After install, **tell the user to restart the Claude Code session** so `/3p` registers in the skill list. The skill will then be invocable as `/3p <task description>`.
+After install, **tell the user to restart the Claude Code session** so `/3p` registers in the skill list and PAL MCP reloads the reviewer roles. In normal Claude Code usage, restarting Claude Code is the PAL MCP restart. If the user runs PAL MCP as a separate process, restart that process instead.
 
 ---
 
@@ -92,11 +106,46 @@ If the reviewer calls fail with "tool not found" or similar, see PAL MCP setup a
 /3p --resume <task-slug>     # Resume an interrupted run
 /3p --list                   # List recent runs in this repo
 /3p --clean <task-slug>      # Remove a run's artifacts + git refs
+/3p --model-power            # Prompt to choose high or low reviewer models
+/3p --model-power high       # Use high-power reviewer models for future runs
+/3p --model-power low        # Use faster/lighter reviewer models for future runs
+/3p --models                 # Show the model names mapped to low/high
+/3p --models set codex high gpt-5.5
+/3p --models set gemini high pro
+/3p --update                 # Pull and reinstall the skill from its git checkout
 /3p --config <path>          # Use a non-default config file
 /3p --exclude <pattern>      # Add an extra snapshot exclusion (repeatable)
 ```
 
 `--config` and `--exclude` are consumed only at the start of a new run; they are persisted into `state.resolvedConfig` so `--resume` reuses them automatically.
+
+### Reviewer model power
+
+`/3p` uses PAL `clink` roles to choose reviewer models. The installer creates low/high reviewer roles for each CLI, and each run resolves a model-specific PAL role from the model names frozen into that run's `state.resolvedConfig`.
+
+| Power | Codex default | Gemini default | Use when |
+|---|---|---|---|
+| `high` | `gpt-5.5` | `pro` | Deep review, risky changes, architecture/security-sensitive work |
+| `low` | `gpt-5.4-mini` | `flash` | Faster review for smaller or lower-risk tasks |
+
+Run this to choose without remembering the values:
+
+```
+/3p --model-power
+```
+
+The choice is saved in `.3p/config.json` as `modelPower` and applies to new runs. Each run snapshots the resolved model power and model names at init time, so changing model power or model mappings will not silently change a run already in progress.
+
+Advanced users can change what low/high mean:
+
+```
+/3p --models set codex high gpt-6.0
+/3p --models set codex low gpt-5.4-mini
+/3p --models set gemini high pro
+/3p --models set gemini low flash
+```
+
+After changing model mappings with `/3p --models set ...` or a config file, restart Claude Code so PAL MCP reloads the updated role arguments. If PAL MCP is running as a separate process, restart that process instead. Changing only `/3p --model-power high|low` does not require a restart after the roles have been loaded once.
 
 ---
 
@@ -135,6 +184,17 @@ Built-in defaults can be overridden by a `.3p/config.json` file at your repo roo
   "roundCap": 10,
   "timeoutSeconds": 120,
   "consecutiveFailuresForDowngrade": 3,
+  "modelPower": "high",
+  "models": {
+    "codex": {
+      "high": "gpt-5.5",
+      "low": "gpt-5.4-mini"
+    },
+    "gemini": {
+      "high": "pro",
+      "low": "flash"
+    }
+  },
   "excludes": ["custom_dir/"],
   "extraExcludes": ["more_dir/"]
 }
@@ -145,9 +205,24 @@ Built-in defaults can be overridden by a `.3p/config.json` file at your repo roo
 | `roundCap` | `10` | Max rounds per phase before cap-reached exit |
 | `timeoutSeconds` | `120` | Per-reviewer call timeout |
 | `consecutiveFailuresForDowngrade` | `3` | Failures before user is offered single-reviewer downgrade |
+| `modelPower` | `high` | Selects high or low reviewer model mappings for new runs |
+| `models.codex.high` | `gpt-5.5` | Codex model used by the high-power reviewer role |
+| `models.codex.low` | `gpt-5.4-mini` | Codex model used by the low-power reviewer role |
+| `models.gemini.high` | `pro` | Gemini CLI alias used by the high-power reviewer role |
+| `models.gemini.low` | `flash` | Gemini CLI alias used by the low-power reviewer role |
 | `excludes` | (default bloat list) | **Replaces** default `node_modules/`, `dist/`, etc. |
 | `extraExcludes` | `[]` | **Appends** to defaults |
 | `secretPatterns` | (hardcoded list) | User can extend; hardcoded patterns CANNOT be removed |
+
+### Auto-update
+
+If the skill was installed from a git checkout, run:
+
+```
+/3p --update
+```
+
+This fetches the latest changes, performs a fast-forward-only pull, reruns `install.sh`, and reinstalls the PAL reviewer roles. Restart Claude Code after updating so PAL MCP reloads those roles. If the installed skill was copied without its source git checkout, auto-update will stop with a clear message and you should reinstall from the repository.
 
 ---
 
@@ -166,7 +241,7 @@ claude-code-3p/
 │   ├── step-review.md        # Phase B reviewer prompt template
 │   └── final-review.md       # Phase C reviewer prompt template
 └── tests/
-    └── test_*.py             # 65 pytest tests covering all helpers
+    └── test_*.py             # 76 pytest tests covering all helpers
 ```
 
 Run the test suite locally:
@@ -182,6 +257,9 @@ python3 -m pytest tests/ -v
 
 **`/3p` doesn't appear in Claude Code's skill list**
 Restart your Claude Code session after running `./install.sh`. Skills register at session start.
+
+**Reviewer role fails with "not one of ['codereviewer', 'default', 'planner']"**
+Restart Claude Code so PAL MCP reloads the reviewer roles written by install/update/model changes. In normal Claude Code usage, this is enough. If PAL MCP is managed as a separate long-running process, restart that process instead.
 
 **Reviewer calls fail with "tool not found" or similar**
 PAL MCP, codex CLI, or gemini CLI is not configured. See [PAL MCP setup](#pal-mcp-setup-most-common-gotcha).

@@ -97,6 +97,18 @@ def test_snapshot_excludes_git_dir(script_path, tmp_git_repo):
     assert not (snap / ".git").exists()
 
 
+def test_snapshot_excludes_symlink_files(script_path, tmp_git_repo, tmp_path):
+    outside = tmp_path.parent / "outside-secret.txt"
+    outside.write_text("OUTSIDE_SECRET=leaked\n")
+    (tmp_git_repo / "public.txt").symlink_to(outside)
+    (tmp_git_repo / "normal.txt").write_text("ok\n")
+    run_3p(script_path, tmp_git_repo, "init", "x", "20260603-1430")
+    run_3p(script_path, tmp_git_repo, "snapshot", "capture", "x-20260603-1430", "pre-build")
+    snap = tmp_git_repo / ".3p" / "x-20260603-1430" / "baselines" / "pre-build"
+    assert (snap / "normal.txt").exists()
+    assert not (snap / "public.txt").exists()
+
+
 def test_snapshot_uses_resolved_config_not_cli(script_path, tmp_git_repo):
     setup_repo_with_files(tmp_git_repo, **{"src/a.py": "x", "data/big.bin": "BIG"})
     run_3p(script_path, tmp_git_repo, "init", "x", "20260603-1430", "--exclude", "data/")

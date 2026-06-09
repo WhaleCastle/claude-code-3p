@@ -72,9 +72,62 @@ DEFAULTS = {
     "timeoutSeconds": 120,
     "roundCap": 10,
     "consecutiveFailuresForDowngrade": 3,
+    "modelPower": "high",
+    "models": {
+        "codex": {
+            "high": "gpt-5.5",
+            "low": "gpt-5.4-mini",
+        },
+        "gemini": {
+            "high": "pro",
+            "low": "flash",
+        },
+    },
     "excludes": list(DEFAULT_BLOAT_EXCLUDES),
     "secretPatterns": list(HARDCODED_SECRET_PATTERNS),
 }
+
+MODEL_POWERS = {"low", "high"}
+MODEL_REVIEWERS = {"codex", "gemini"}
+PAL_RESTART_MESSAGE = (
+    "Restart Claude Code so PAL MCP reloads reviewer roles. "
+    "If you run PAL MCP as a separate process, restart that process instead."
+)
+
+
+def ensure_string_list(value, key: str) -> list:
+    if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+        raise SystemExit(f"Invalid {key}: expected an array of strings.")
+    return list(value)
+
+
+def normalize_config(cfg: dict) -> dict:
+    """Validate and fill derived defaults for the persisted user config."""
+    power = cfg.get("modelPower", DEFAULTS["modelPower"])
+    if power not in MODEL_POWERS:
+        raise SystemExit(
+            f"Invalid modelPower: {power!r}. Expected one of: low, high."
+        )
+    cfg["modelPower"] = power
+
+    models = cfg.get("models")
+    if not isinstance(models, dict):
+        models = {}
+    normalized_models = json.loads(json.dumps(DEFAULTS["models"]))
+    for reviewer in MODEL_REVIEWERS:
+        reviewer_models = models.get(reviewer)
+        if not isinstance(reviewer_models, dict):
+            continue
+        for pwr in MODEL_POWERS:
+            value = reviewer_models.get(pwr)
+            if value is not None:
+                if not isinstance(value, str) or not value.strip():
+                    raise SystemExit(
+                        f"Invalid models.{reviewer}.{pwr}: expected a non-empty string."
+                    )
+                normalized_models[reviewer][pwr] = value.strip()
+    cfg["models"] = normalized_models
+    return cfg
 
 
 def load_config(anchor: Path, config_path=None, cli_excludes=None) -> dict:
@@ -94,14 +147,14 @@ def load_config(anchor: Path, config_path=None, cli_excludes=None) -> dict:
             file_cfg = {}
         for k, v in file_cfg.items():
             if k == "excludes":
-                cfg["excludes"] = list(v)  # replace defaults
+                cfg["excludes"] = ensure_string_list(v, "excludes")  # replace defaults
             elif k == "extraExcludes":
-                for x in v:
+                for x in ensure_string_list(v, "extraExcludes"):
                     if x not in cfg["excludes"]:
                         cfg["excludes"].append(x)
             elif k == "secretPatterns":
                 merged = list(HARDCODED_SECRET_PATTERNS)
-                for x in v:
+                for x in ensure_string_list(v, "secretPatterns"):
                     if x not in merged:
                         merged.append(x)
                 cfg["secretPatterns"] = merged
@@ -114,7 +167,63 @@ def load_config(anchor: Path, config_path=None, cli_excludes=None) -> dict:
     for p in HARDCODED_SECRET_PATTERNS:
         if p not in cfg["secretPatterns"]:
             cfg["secretPatterns"].append(p)
-    return cfg
+    return normalize_config(cfg)
+
+
+def project_config_path(anchor: Path) -> Path:
+    return anchor / ".3p" / "config.json"
+
+
+def read_project_config(anchor: Path) -> dict:
+    path = project_config_path(anchor)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"Malformed {path}: {e}") from e
+
+
+def write_project_config(anchor: Path, data: dict) -> None:
+    path = project_config_path(anchor)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, data)
+
+
+def reviewer_role_name(power: str) -> str:
+    if power not in MODEL_POWERS:
+        raise SystemExit(f"Invalid model power: {power!r}")
+    return f"codereviewer-{power}"
+
+
+def stable_model_role_name(power: str, reviewer: str, model_name: str) -> str:
+    if power not in MODEL_POWERS or reviewer not in MODEL_REVIEWERS:
+        raise SystemExit(f"Invalid reviewer/model power: {reviewer!r}/{power!r}")
+    digest = hashlib.sha256(model_name.encode("utf-8")).hexdigest()[:10]
+    return f"codereviewer-{power}-{digest}"
+
+
+def parse_config_flags(args: list, *, usage: str):
+    config_path = None
+    cli_excludes = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--config":
+            if i + 1 >= len(args):
+                print(usage, file=sys.stderr)
+                return None, None, 2
+            config_path = Path(args[i + 1])
+            i += 2
+        elif args[i] == "--exclude":
+            if i + 1 >= len(args):
+                print(usage, file=sys.stderr)
+                return None, None, 2
+            cli_excludes.append(args[i + 1])
+            i += 2
+        else:
+            print(f"Unknown flag: {args[i]}", file=sys.stderr)
+            return None, None, 2
+    return config_path, cli_excludes, 0
 
 
 def find_anchor():
@@ -194,19 +303,12 @@ def cmd_init(args: list) -> int:
               file=sys.stderr)
         return 2
     slug, ts = args[0], args[1]
-    config_path = None
-    cli_excludes = []
-    i = 2
-    while i < len(args):
-        if args[i] == "--config":
-            config_path = Path(args[i + 1])
-            i += 2
-        elif args[i] == "--exclude":
-            cli_excludes.append(args[i + 1])
-            i += 2
-        else:
-            print(f"Unknown flag: {args[i]}", file=sys.stderr)
-            return 2
+    config_path, cli_excludes, status = parse_config_flags(
+        args[2:],
+        usage="Usage: 3p.py init <slug> <timestamp> [--config <p>] [--exclude <pat>]...",
+    )
+    if status:
+        return status
     run_id = f"{slug}-{ts}"
     anchor, is_git = find_anchor()
     if is_git:
@@ -286,22 +388,210 @@ def cmd_availability_append(args: list) -> int:
 
 
 def cmd_config_load(args: list) -> int:
-    config_path = None
-    cli_excludes = []
-    i = 0
-    while i < len(args):
-        if args[i] == "--config":
-            config_path = Path(args[i + 1])
-            i += 2
-        elif args[i] == "--exclude":
-            cli_excludes.append(args[i + 1])
-            i += 2
-        else:
-            print(f"Unknown flag: {args[i]}", file=sys.stderr)
-            return 2
+    config_path, cli_excludes, status = parse_config_flags(
+        args,
+        usage="Usage: 3p.py config-load [--config <p>] [--exclude <pat>]...",
+    )
+    if status:
+        return status
     anchor = Path.cwd()
     cfg = load_config(anchor, config_path, cli_excludes)
     print(json.dumps(cfg, indent=2))
+    return 0
+
+
+def cmd_model_power(args: list) -> int:
+    if len(args) > 1:
+        print("Usage: 3p.py model-power [low|high]", file=sys.stderr)
+        return 2
+    anchor, _ = find_anchor()
+    if not args:
+        cfg = load_config(anchor)
+        print(cfg["modelPower"])
+        return 0
+    power = args[0]
+    if power not in MODEL_POWERS:
+        print("Usage: 3p.py model-power [low|high]", file=sys.stderr)
+        return 2
+    raw = read_project_config(anchor)
+    raw["modelPower"] = power
+    normalize_config(json.loads(json.dumps({**DEFAULTS, **raw})))
+    write_project_config(anchor, raw)
+    print(power)
+    return 0
+
+
+def cmd_models(args: list) -> int:
+    anchor, _ = find_anchor()
+    if not args or args == ["list"]:
+        cfg = load_config(anchor)
+        print(json.dumps(cfg["models"], indent=2))
+        return 0
+    if len(args) == 4 and args[0] == "set":
+        _, reviewer, power, model_name = args
+        if reviewer not in MODEL_REVIEWERS or power not in MODEL_POWERS or not model_name.strip():
+            print("Usage: 3p.py models set <codex|gemini> <low|high> <model>", file=sys.stderr)
+            return 2
+        raw = read_project_config(anchor)
+        if not isinstance(raw.get("models", {}), dict):
+            raw["models"] = {}
+        raw_models = raw.setdefault("models", {})
+        if not isinstance(raw_models.get(reviewer, {}), dict):
+            raw_models[reviewer] = {}
+        raw_reviewer = raw_models.setdefault(reviewer, {})
+        raw_reviewer[power] = model_name.strip()
+        normalize_config(json.loads(json.dumps({**DEFAULTS, **raw})))
+        write_project_config(anchor, raw)
+        install_pal_config(load_config(anchor))
+        print(f"{reviewer}.{power}={model_name.strip()}")
+        print(PAL_RESTART_MESSAGE)
+        return 0
+    print("""Usage: 3p.py models [list]
+       3p.py models set <codex|gemini> <low|high> <model>""", file=sys.stderr)
+    return 2
+
+
+def cmd_reviewer_role(args: list) -> int:
+    if len(args) != 2:
+        print("Usage: 3p.py reviewer-role <run-id> <codex|gemini>", file=sys.stderr)
+        return 2
+    run_id, reviewer = args
+    if reviewer not in MODEL_REVIEWERS:
+        print("Usage: 3p.py reviewer-role <run-id> <codex|gemini>", file=sys.stderr)
+        return 2
+    anchor, _ = find_anchor()
+    state = read_state(run_dir_path(anchor, run_id))
+    cfg = normalize_config(state.get("resolvedConfig", {}))
+    power = cfg["modelPower"]
+    model_name = cfg["models"][reviewer][power]
+    install_pal_config(cfg)
+    print(stable_model_role_name(power, reviewer, model_name))
+    return 0
+
+
+DEFAULT_CLI_CLIENTS = {
+    "codex": {
+        "name": "codex",
+        "command": "codex",
+        "additional_args": [
+            "--skip-git-repo-check",
+            "--json",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--enable",
+            "web_search_request",
+        ],
+        "env": {},
+        "roles": {
+            "default": {
+                "prompt_path": "systemprompts/clink/default.txt",
+                "role_args": [],
+            },
+            "planner": {
+                "prompt_path": "systemprompts/clink/default_planner.txt",
+                "role_args": [],
+            },
+            "codereviewer": {
+                "prompt_path": "systemprompts/clink/codex_codereviewer.txt",
+                "role_args": [],
+            },
+        },
+    },
+    "gemini": {
+        "name": "gemini",
+        "command": "gemini",
+        "additional_args": ["--yolo"],
+        "env": {},
+        "roles": {
+            "default": {
+                "prompt_path": "systemprompts/clink/default.txt",
+                "role_args": [],
+            },
+            "planner": {
+                "prompt_path": "systemprompts/clink/default_planner.txt",
+                "role_args": [],
+            },
+            "codereviewer": {
+                "prompt_path": "systemprompts/clink/default_codereviewer.txt",
+                "role_args": [],
+            },
+        },
+    },
+}
+
+
+def load_cli_client_config(reviewer: str) -> dict:
+    path = Path.home() / ".pal" / "cli_clients" / f"{reviewer}.json"
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"Malformed PAL CLI config {path}: {e}") from e
+    return json.loads(json.dumps(DEFAULT_CLI_CLIENTS[reviewer]))
+
+
+def write_cli_client_config(reviewer: str, data: dict) -> None:
+    path = Path.home() / ".pal" / "cli_clients" / f"{reviewer}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, data)
+
+
+def install_pal_config(cfg: dict) -> None:
+    for reviewer in sorted(MODEL_REVIEWERS):
+        client = load_cli_client_config(reviewer)
+        client["name"] = reviewer
+        client.setdefault("command", reviewer)
+        client.setdefault("additional_args", [])
+        client.setdefault("env", {})
+        roles = client.setdefault("roles", {})
+        base_role = roles.get("codereviewer") or DEFAULT_CLI_CLIENTS[reviewer]["roles"]["codereviewer"]
+        prompt_path = base_role.get("prompt_path") or DEFAULT_CLI_CLIENTS[reviewer]["roles"]["codereviewer"]["prompt_path"]
+        for power in sorted(MODEL_POWERS):
+            model_name = cfg["models"][reviewer][power]
+            role = {
+                "prompt_path": prompt_path,
+                "role_args": ["--model", model_name],
+            }
+            roles[reviewer_role_name(power)] = role
+            roles[stable_model_role_name(power, reviewer, model_name)] = role
+        write_cli_client_config(reviewer, client)
+
+
+def cmd_pal_config(args: list) -> int:
+    if args != ["install"]:
+        print("Usage: 3p.py pal-config install", file=sys.stderr)
+        return 2
+    anchor, _ = find_anchor()
+    install_pal_config(load_config(anchor))
+    print("installed PAL codereviewer-low/codereviewer-high roles")
+    print(PAL_RESTART_MESSAGE)
+    return 0
+
+
+def cmd_update(args: list) -> int:
+    if args:
+        print("Usage: 3p.py update", file=sys.stderr)
+        return 2
+    skill_root = Path(__file__).resolve().parents[1]
+    meta_path = skill_root / "install.json"
+    source = skill_root
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+            if meta.get("source"):
+                source = Path(meta["source"]).expanduser()
+        except json.JSONDecodeError:
+            pass
+    if not (source / ".git").exists():
+        print(f"Cannot auto-update: {source} is not a git checkout.", file=sys.stderr)
+        return 1
+    for command in (["git", "fetch", "--quiet"], ["git", "pull", "--ff-only"], ["./install.sh"]):
+        result = _sp.run(command, cwd=source, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(result.stdout, end="")
+            print(result.stderr, end="", file=sys.stderr)
+            return result.returncode
+    print("updated 3p skill")
+    print(PAL_RESTART_MESSAGE)
     return 0
 
 
@@ -312,6 +602,12 @@ Subcommands:
   slug <task-description>
   init <slug> <timestamp> [--config <p>] [--exclude <pat>]...
   config-load
+  model-power [low|high]
+  models [list]
+  models set <codex|gemini> <low|high> <model>
+  reviewer-role <run-id> <codex|gemini>
+  pal-config install
+  update
   state-read <run-id> <key>
   state-write <run-id> <key> <value-json>
   availability-append <run-id> <entry-json>
@@ -373,6 +669,16 @@ def verify_git_ref_format(ref_path: str) -> None:
 
 
 ALWAYS_EXCLUDED_DIRS = {".3p", ".git"}
+
+
+def live_path_allowed(anchor: Path, rel_path: str) -> bool:
+    path = anchor / rel_path
+    try:
+        resolved = path.resolve()
+        anchor_resolved = anchor.resolve()
+    except OSError:
+        return False
+    return resolved == anchor_resolved or anchor_resolved in resolved.parents
 
 
 def pattern_matches(rel_path: str, pattern: str) -> bool:
@@ -558,6 +864,9 @@ def enumerate_files_git(anchor: Path, user_excludes: list, secret_patterns: list
     paths = [p for p in result.stdout.decode("utf-8").split("\x00") if p]
     out = []
     for rel in paths:
+        path = anchor / rel
+        if path.is_symlink() or not live_path_allowed(anchor, rel):
+            continue
         top = rel.split("/", 1)[0]
         if top in ALWAYS_EXCLUDED_DIRS:
             continue
@@ -599,6 +908,9 @@ def enumerate_files_nongit(anchor: Path, user_excludes: list,
         for d in dirs:
             if d in ALWAYS_EXCLUDED_DIRS:
                 continue
+            full_dir = Path(root) / d
+            if full_dir.is_symlink():
+                continue
             rel_d = f"{rel_root}/{d}" if rel_root else d
             positively_excluded = (
                 should_exclude(rel_d + "/", secret_patterns)
@@ -613,10 +925,15 @@ def enumerate_files_nongit(anchor: Path, user_excludes: list,
             new_dirs.append(d)
         dirs[:] = new_dirs
         for f in files:
+            full_file = Path(root) / f
+            if full_file.is_symlink():
+                continue
             rel = f"{rel_root}/{f}" if rel_root else f
             candidates.append(rel)
     out = []
     for rel in candidates:
+        if not live_path_allowed(anchor, rel):
+            continue
         top = rel.split("/", 1)[0]
         if top in ALWAYS_EXCLUDED_DIRS:
             continue
@@ -760,6 +1077,8 @@ def cmd_snapshot_diff(args: list) -> int:
     for rel in union:
         snap_file = snap_path / rel
         live_file = anchor / rel
+        if live_file.is_symlink() or not live_path_allowed(anchor, rel):
+            continue
         snap_exists = snap_file.exists()
         live_exists = live_file.exists()
         if snap_exists and live_exists:
@@ -793,6 +1112,9 @@ def cmd_snapshot_diff(args: list) -> int:
             rel_root = ""
         dirs[:] = [d for d in dirs if d not in ALWAYS_EXCLUDED_DIRS]
         for f in files:
+            full_file = Path(root) / f
+            if full_file.is_symlink():
+                continue
             rel = f"{rel_root}/{f}" if rel_root else f
             if should_exclude(rel, cfg["secretPatterns"]):
                 dropped_secrets.append(rel)
@@ -864,6 +1186,8 @@ def cmd_snapshot_capture(args: list) -> int:
     snap_dir.mkdir(parents=True, exist_ok=True)
     for rel in files:
         src = anchor / rel
+        if src.is_symlink() or not live_path_allowed(anchor, rel):
+            continue
         dst = snap_dir / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
@@ -1186,6 +1510,11 @@ def main(argv: list) -> int:
     dispatcher = {
         "slug": cmd_slug,
         "config-load": cmd_config_load,
+        "model-power": cmd_model_power,
+        "models": cmd_models,
+        "reviewer-role": cmd_reviewer_role,
+        "pal-config": cmd_pal_config,
+        "update": cmd_update,
         "init": cmd_init,
         "state-read": cmd_state_read,
         "state-write": cmd_state_write,

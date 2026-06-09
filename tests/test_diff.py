@@ -115,6 +115,20 @@ def test_diff_excludes_bloat_dirs(script_path, tmp_git_repo):
     assert "node_modules" not in r.stdout
 
 
+def test_diff_does_not_follow_symlink_to_external_file(script_path, tmp_git_repo, tmp_path):
+    outside = tmp_path.parent / "outside-secret.txt"
+    outside.write_text("OUTSIDE_SECRET=leaked\n")
+    (tmp_git_repo / "a.py").write_text("ok\n")
+    (tmp_git_repo / "public.txt").symlink_to(outside)
+    run_3p(script_path, tmp_git_repo, "init", "x", "20260603-1430")
+    run_3p(script_path, tmp_git_repo, "snapshot", "capture", "x-20260603-1430", "step-1")
+    outside.write_text("OUTSIDE_SECRET=changed\n")
+    r = run_3p(script_path, tmp_git_repo, "snapshot", "diff", "x-20260603-1430", "step-1")
+    assert r.returncode == 0, r.stderr
+    assert "OUTSIDE_SECRET" not in r.stdout
+    assert "public.txt" not in r.stdout
+
+
 def test_diff_honors_captured_info_exclude_for_new_files(script_path, tmp_git_repo):
     """Spec: live-side diff must honor captured-time .git/info/exclude rules.
     A file added to info/exclude AND created after baseline must NOT appear in diff."""
