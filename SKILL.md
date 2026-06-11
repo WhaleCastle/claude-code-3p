@@ -174,6 +174,30 @@ For each round:
    - `ignored` — true but out of scope / taste / hypothetical → won't fix, one-line reason
    For each finding, fill `verdict` and `verdictReason` fields in the JSON. **For rebuttal items** (rejected/ignored findings that the reviewer pushed back on, OR new pushbacks the reviewer raised this round in response to prior rejections), populate the `rebuttals` array on the verdicts JSON: `[{originalRound, originalTitle, claudeReasonPrior, reviewerPushback, claudeReasonNow, outcome: "withdrawn"|"sustained"|"now-accepted"}, ...]`.
 8. **Write the round file**: `3PSH round-write <run-id> <phase> <step-or-dash> <round> <reviewer> <verdicts-json>` for each reviewer. The round-write helper renders both findings AND the rebuttals array into the markdown.
+
+   **`verdicts-json` shape.** This is built by merging `parse-response` output (which gives `severity/title/location/issue/rationale`) with your per-finding decisions (`verdict/verdictReason`) and a top-level `reviewer`. Required per finding: `severity`, `title`, `verdict`. Other fields default to `""` if absent. The `reviewer` key must equal the CLI arg (it is auto-injected if you omit it). `status` is inferred (`findings` if any, else `approved`) when omitted.
+
+   ```json
+   {
+     "reviewer": "codex",
+     "status": "findings",
+     "durationSeconds": 0,
+     "findings": [
+       {
+         "severity": "Important",
+         "title": "Missing auth check on /admin route",
+         "location": "routes/admin.py:12-20",
+         "issue": "Handler reads session but never verifies role.",
+         "rationale": "Any logged-in user reaches admin actions.",
+         "verdict": "accepted",
+         "verdictReason": "real authz gap, fixing"
+       }
+     ],
+     "rebuttals": []
+   }
+   ```
+
+   For `status: "approved"` use `"findings": []`; for `status: "unavailable"` add `"raw": "<reviewer text>"`. `status` must be one of `approved`/`findings`/`unavailable`, and `approved`/`unavailable` records must NOT carry findings (use `status: "findings"` to record them). Each `rebuttals` entry requires `outcome`; its other fields (`originalRound`, `originalTitle`, `claudeReasonPrior`, `reviewerPushback`, `claudeReasonNow`) default to `""` if absent.
 9. **Apply accepted-finding fixes.** Edit the plan (Phase A) or code (Phase B) or fail-out (Phase C — apply post-hoc fixes to code if needed; rare).
 10. **Decide exit:** Apply all `accepted`-finding fixes to the artifact, then decide:
     - **Approved exit:** **This round was fully attended** (both reviewers responded with structured output) **and both reviewers emitted the explicit `APPROVED` token** for the **current** artifact (the version revised after this round's accepted findings, if any). Exit phase. *Exception:* if user-authorized downgrade mode is active for the run, the working reviewer's APPROVED is sufficient.

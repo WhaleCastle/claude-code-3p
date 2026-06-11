@@ -1050,6 +1050,32 @@ _FINDING_HEADER = re.compile(
 )
 
 
+# Caps that keep a bloated reviewer response (e.g. an agent CLI that echoes its
+# entire chain-of-thought / tool-call transcript around a one-line verdict) from
+# polluting round files and parsed output. The structured verdict is *extracted*
+# (findings headers / APPROVED token), and each field is bounded; only a
+# genuinely unparseable response keeps raw text, and even that is windowed.
+_MAX_FIELD_CHARS = 2000
+_MAX_RAW_CHARS = 8000
+
+
+def _truncate(s: str, limit: int = _MAX_FIELD_CHARS) -> str:
+    if len(s) <= limit:
+        return s
+    return s[:limit].rstrip() + f" …[truncated {len(s) - limit} chars]"
+
+
+def _cap_raw(text: str, limit: int = _MAX_RAW_CHARS) -> str:
+    """Window an unparseable response to head+tail. An agent CLI's actual verdict
+    usually lands at the very end (after its transcript), so keep both ends rather
+    than chopping the tail and losing the conclusion."""
+    if len(text) <= limit:
+        return text
+    half = limit // 2
+    elided = len(text) - 2 * half
+    return f"{text[:half]}\n…[{elided} chars elided]…\n{text[-half:]}"
+
+
 def _extract_field(block: str, name: str) -> str:
     m = re.search(rf"^{name}:\s*(.+?)(?:\n[A-Z][a-z]+:|\Z)", block, re.M | re.S)
     return m.group(1).strip() if m else ""
@@ -1064,18 +1090,20 @@ def parse_response(text: str) -> dict:
         start = m.end()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
         block = text[start:end]
+        # Each field is bounded: a trailing transcript with no further field
+        # label would otherwise let the last finding's Rationale absorb it all.
         findings.append({
             "severity": severity,
-            "title": title,
-            "location": _extract_field(block, "Location"),
-            "issue": _extract_field(block, "Issue"),
-            "rationale": _extract_field(block, "Rationale"),
+            "title": _truncate(title),
+            "location": _truncate(_extract_field(block, "Location")),
+            "issue": _truncate(_extract_field(block, "Issue")),
+            "rationale": _truncate(_extract_field(block, "Rationale")),
         })
     if findings:
         return {"status": "findings", "findings": findings}
     if re.search(r"^APPROVED\s*$", text, re.M):
         return {"status": "approved", "findings": []}
-    return {"status": "unavailable", "raw": text, "findings": []}
+    return {"status": "unavailable", "raw": _cap_raw(text), "findings": []}
 
 
 def cmd_parse_response(args: list) -> int:
@@ -1356,6 +1384,109 @@ def _append_rebuttals(out: list, v: dict) -> str:
     return "\n".join(out)
 
 
+# The complete set of statuses render_reviewer_section knows how to render.
+_VALID_STATUSES = ("approved", "findings", "unavailable")
+# Per-finding fields the orchestrator must decide (hard error if absent).
+_FINDING_REQUIRED = ("severity", "title", "verdict")
+# Descriptive fields that default to "" when absent rather than crashing. These
+# come from parse-response (location/issue/rationale) or are Claude's one-liner
+# (verdictReason); a missing one should never abort a round-write.
+_FINDING_OPTIONAL = ("location", "issue", "rationale", "verdictReason")
+# Rebuttal-exchange fields are hand-assembled too (SKILL.md step 7), so they get
+# the same treatment as findings: one required decision field, the rest default.
+_REBUTTAL_REQUIRED = ("outcome",)
+_REBUTTAL_OPTIONAL = ("originalRound", "originalTitle", "claudeReasonPrior",
+                      "reviewerPushback", "claudeReasonNow")
+
+
+class VerdictsError(ValueError):
+    """Actionable, user-facing validation error for a hand-assembled
+    verdicts-json. Caught in cmd_round_write and printed without a traceback."""
+
+
+def _normalize_rebuttals(v) -> None:
+    """Validate/default the rebuttals array so _append_rebuttals never raw-
+    KeyErrors on a hand-assembled entry — the same failure class normalize_
+    verdicts exists to eliminate for findings."""
+    rebuttals = v.get("rebuttals")
+    if rebuttals is None:
+        return
+    if not isinstance(rebuttals, list):
+        raise VerdictsError("round-write: 'rebuttals' must be a JSON array")
+    for i, r in enumerate(rebuttals):
+        if not isinstance(r, dict):
+            raise VerdictsError(f"round-write: rebuttals[{i}] must be a JSON object")
+        for key in _REBUTTAL_REQUIRED:
+            if not r.get(key):
+                raise VerdictsError(
+                    f"round-write: rebuttals[{i}] missing required field {key!r} "
+                    f"(needs: {', '.join(_REBUTTAL_REQUIRED)})"
+                )
+        for key in _REBUTTAL_OPTIONAL:
+            r.setdefault(key, "")
+
+
+def normalize_verdicts(v, reviewer: str) -> dict:
+    """Validate + fill the hand-assembled verdicts-JSON so round-write fails
+    with an actionable VerdictsError (naming the missing field) instead of a raw
+    KeyError/AssertionError traceback. The CLI `reviewer` arg is authoritative:
+    a missing `reviewer` key is injected; a mismatched one is a clear error."""
+    if not isinstance(v, dict):
+        raise VerdictsError(
+            f"round-write: verdicts-json must be a JSON object, got {type(v).__name__}"
+        )
+    got = v.get("reviewer")
+    if got in (None, ""):
+        v["reviewer"] = reviewer
+    elif got != reviewer:
+        raise VerdictsError(
+            f"round-write: verdicts-json reviewer {got!r} != CLI arg {reviewer!r}"
+        )
+    # Rebuttals can ride along on approved OR findings status, so normalize them
+    # before the approved/unavailable early-return below.
+    _normalize_rebuttals(v)
+    findings = v.get("findings")
+    if findings is None:
+        findings = []
+    # Validate the type BEFORE coercion or status inference. Using `or []`
+    # here would silently turn a malformed falsey non-list ({}, "", 0, False)
+    # into an empty round, and an absent status would then be inferred as
+    # "approved" — both hiding the assembly error this function exists to surface.
+    if not isinstance(findings, list):
+        raise VerdictsError("round-write: 'findings' must be a JSON array")
+    if "status" not in v or not v["status"]:
+        v["status"] = "findings" if findings else "approved"
+    if v["status"] not in _VALID_STATUSES:
+        raise VerdictsError(
+            f"round-write: invalid status {v['status']!r} "
+            f"(expected one of {', '.join(_VALID_STATUSES)})"
+        )
+    if v["status"] in ("approved", "unavailable"):
+        # Findings on an approved/unavailable record are silently dropped by the
+        # renderer, which loses real review data from the audit trail — reject it.
+        if findings:
+            raise VerdictsError(
+                f"round-write: status {v['status']!r} must not carry findings "
+                f"(got {len(findings)}); use status 'findings' to record them"
+            )
+        v["findings"] = findings
+        return v
+    for i, f in enumerate(findings):
+        if not isinstance(f, dict):
+            raise VerdictsError(f"round-write: findings[{i}] must be a JSON object")
+        for key in _FINDING_REQUIRED:
+            if not f.get(key):
+                raise VerdictsError(
+                    f"round-write: findings[{i}] missing required field {key!r} "
+                    f"(needs: {', '.join(_FINDING_REQUIRED)}). For findings copied "
+                    f"from parse-response, add 'verdict' and 'verdictReason'."
+                )
+        for key in _FINDING_OPTIONAL:
+            f.setdefault(key, "")
+    v["findings"] = findings
+    return v
+
+
 def cmd_round_write(args: list) -> int:
     if len(args) != 6:
         print("Usage: 3p.py round-write <run-id> <phase> <step|-> <round> <reviewer> <verdicts-json>",
@@ -1363,8 +1494,16 @@ def cmd_round_write(args: list) -> int:
         return 2
     run_id, phase, step, rnd_s, reviewer, verdicts_json = args
     rnd = int(rnd_s)
-    v = json.loads(verdicts_json)
-    assert v["reviewer"] == reviewer
+    try:
+        v = json.loads(verdicts_json)
+    except json.JSONDecodeError as e:
+        print(f"round-write: verdicts-json is not valid JSON: {e}", file=sys.stderr)
+        return 2
+    try:
+        v = normalize_verdicts(v, reviewer)
+    except VerdictsError as e:
+        print(str(e), file=sys.stderr)
+        return 2
     anchor, _ = find_anchor()
     run_dir = run_dir_path(anchor, run_id)
     path = run_dir / round_filename(phase, step, rnd, reviewer)
