@@ -30,7 +30,7 @@ path.write_text(json.dumps({"source": str(source)}, indent=2) + "\n")
 PY
 
 echo "Installed 3p skill to $DST"
-echo "Installed PAL clink reviewer roles: codereviewer-low, codereviewer-high"
+echo "Installed PAL clink reviewer roles: codereviewer-{low,high}-{reasoning,code} (codex + antigravity/agy)"
 echo "Restart Claude Code so PAL MCP reloads the reviewer roles."
 echo "If you run PAL MCP as a separate process, restart that process instead."
 echo

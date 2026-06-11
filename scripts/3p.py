@@ -74,13 +74,22 @@ DEFAULTS = {
     "consecutiveFailuresForDowngrade": 3,
     "modelPower": "high",
     "models": {
+        # models[reviewer][power][reviewType]. Codex uses the same model for
+        # both review types (the user only differentiated Antigravity); the
+        # schema is kept uniform so role resolution is a single code path.
         "codex": {
-            "high": "gpt-5.5",
-            "low": "gpt-5.4-mini",
+            "high": {"reasoning": "gpt-5.5", "code": "gpt-5.5"},
+            "low": {"reasoning": "gpt-5.4-mini", "code": "gpt-5.4-mini"},
         },
-        "gemini": {
-            "high": "pro",
-            "low": "flash",
+        "antigravity": {
+            "high": {
+                "reasoning": "Gemini 3.1 Pro (High)",
+                "code": "Gemini 3.5 Flash (High)",
+            },
+            "low": {
+                "reasoning": "Gemini 3.1 Pro (Low)",
+                "code": "Gemini 3.5 Flash (Low)",
+            },
         },
     },
     "excludes": list(DEFAULT_BLOAT_EXCLUDES),
@@ -88,7 +97,15 @@ DEFAULTS = {
 }
 
 MODEL_POWERS = {"low", "high"}
-MODEL_REVIEWERS = {"codex", "gemini"}
+MODEL_REVIEWERS = {"codex", "antigravity"}
+REVIEW_TYPES = {"reasoning", "code"}
+# A 3p reviewer key -> the PAL clink cli_name (and ~/.pal/cli_clients/<name>.json
+# filename). PAL only supports a fixed set of cli names (codex, gemini, claude,
+# agy) because the name binds the output parser, so the Antigravity reviewer
+# talks to PAL as `agy` even though 3p presents it as "Antigravity".
+REVIEWER_CLI = {"codex": "codex", "antigravity": "agy"}
+# Human-facing display name for each reviewer key.
+REVIEWER_LABEL = {"codex": "Codex", "antigravity": "Antigravity"}
 PAL_RESTART_MESSAGE = (
     "Restart Claude Code so PAL MCP reloads reviewer roles. "
     "If you run PAL MCP as a separate process, restart that process instead."
@@ -120,12 +137,34 @@ def normalize_config(cfg: dict) -> dict:
             continue
         for pwr in MODEL_POWERS:
             value = reviewer_models.get(pwr)
-            if value is not None:
-                if not isinstance(value, str) or not value.strip():
+            if value is None:
+                continue
+            # Legacy flat shape {power: "model"} -> {reasoning: m, code: m}.
+            if isinstance(value, str):
+                if not value.strip():
                     raise SystemExit(
                         f"Invalid models.{reviewer}.{pwr}: expected a non-empty string."
                     )
-                normalized_models[reviewer][pwr] = value.strip()
+                model = value.strip()
+                normalized_models[reviewer][pwr] = {
+                    "reasoning": model, "code": model,
+                }
+                continue
+            if not isinstance(value, dict):
+                raise SystemExit(
+                    f"Invalid models.{reviewer}.{pwr}: expected a string or "
+                    f"a {{reasoning, code}} object."
+                )
+            for rtype in REVIEW_TYPES:
+                rvalue = value.get(rtype)
+                if rvalue is None:
+                    continue
+                if not isinstance(rvalue, str) or not rvalue.strip():
+                    raise SystemExit(
+                        f"Invalid models.{reviewer}.{pwr}.{rtype}: "
+                        f"expected a non-empty string."
+                    )
+                normalized_models[reviewer][pwr][rtype] = rvalue.strip()
     cfg["models"] = normalized_models
     return cfg
 
@@ -190,17 +229,22 @@ def write_project_config(anchor: Path, data: dict) -> None:
     atomic_write_json(path, data)
 
 
-def reviewer_role_name(power: str) -> str:
+def reviewer_role_name(power: str, review_type: str) -> str:
     if power not in MODEL_POWERS:
         raise SystemExit(f"Invalid model power: {power!r}")
-    return f"codereviewer-{power}"
+    if review_type not in REVIEW_TYPES:
+        raise SystemExit(f"Invalid review type: {review_type!r}")
+    return f"codereviewer-{power}-{review_type}"
 
 
-def stable_model_role_name(power: str, reviewer: str, model_name: str) -> str:
+def stable_model_role_name(power: str, reviewer: str, review_type: str,
+                           model_name: str) -> str:
     if power not in MODEL_POWERS or reviewer not in MODEL_REVIEWERS:
         raise SystemExit(f"Invalid reviewer/model power: {reviewer!r}/{power!r}")
+    if review_type not in REVIEW_TYPES:
+        raise SystemExit(f"Invalid review type: {review_type!r}")
     digest = hashlib.sha256(model_name.encode("utf-8")).hexdigest()[:10]
-    return f"codereviewer-{power}-{digest}"
+    return f"codereviewer-{power}-{review_type}-{digest}"
 
 
 def parse_config_flags(args: list, *, usage: str):
@@ -329,7 +373,7 @@ def cmd_init(args: list) -> int:
         "currentRound": 0,
         "reviewerHealth": {
             "codex": {"lastStatus": None, "consecutiveFailures": 0},
-            "gemini": {"lastStatus": None, "consecutiveFailures": 0},
+            "antigravity": {"lastStatus": None, "consecutiveFailures": 0},
         },
         "consecutiveBothDownRounds": 0,
         "downgradeMode": None,
@@ -427,10 +471,12 @@ def cmd_models(args: list) -> int:
         cfg = load_config(anchor)
         print(json.dumps(cfg["models"], indent=2))
         return 0
-    if len(args) == 4 and args[0] == "set":
-        _, reviewer, power, model_name = args
-        if reviewer not in MODEL_REVIEWERS or power not in MODEL_POWERS or not model_name.strip():
-            print("Usage: 3p.py models set <codex|gemini> <low|high> <model>", file=sys.stderr)
+    if len(args) == 5 and args[0] == "set":
+        _, reviewer, power, review_type, model_name = args
+        if (reviewer not in MODEL_REVIEWERS or power not in MODEL_POWERS
+                or review_type not in REVIEW_TYPES or not model_name.strip()):
+            print("Usage: 3p.py models set <codex|antigravity> <low|high> "
+                  "<reasoning|code> <model>", file=sys.stderr)
             return 2
         raw = read_project_config(anchor)
         if not isinstance(raw.get("models", {}), dict):
@@ -439,33 +485,44 @@ def cmd_models(args: list) -> int:
         if not isinstance(raw_models.get(reviewer, {}), dict):
             raw_models[reviewer] = {}
         raw_reviewer = raw_models.setdefault(reviewer, {})
-        raw_reviewer[power] = model_name.strip()
+        existing = raw_reviewer.get(power)
+        if isinstance(existing, str):
+            # Up-convert a legacy flat value {power: "model"} into both review
+            # types first, so overriding one review type does not silently drop
+            # the user's model for the sibling review type.
+            raw_reviewer[power] = {"reasoning": existing, "code": existing}
+        elif not isinstance(existing, dict):
+            raw_reviewer[power] = {}
+        raw_power = raw_reviewer[power]
+        raw_power[review_type] = model_name.strip()
         normalize_config(json.loads(json.dumps({**DEFAULTS, **raw})))
         write_project_config(anchor, raw)
         install_pal_config(load_config(anchor))
-        print(f"{reviewer}.{power}={model_name.strip()}")
+        print(f"{reviewer}.{power}.{review_type}={model_name.strip()}")
         print(PAL_RESTART_MESSAGE)
         return 0
     print("""Usage: 3p.py models [list]
-       3p.py models set <codex|gemini> <low|high> <model>""", file=sys.stderr)
+       3p.py models set <codex|antigravity> <low|high> <reasoning|code> <model>""",
+          file=sys.stderr)
     return 2
 
 
 def cmd_reviewer_role(args: list) -> int:
-    if len(args) != 2:
-        print("Usage: 3p.py reviewer-role <run-id> <codex|gemini>", file=sys.stderr)
+    usage = "Usage: 3p.py reviewer-role <run-id> <codex|antigravity> <reasoning|code>"
+    if len(args) != 3:
+        print(usage, file=sys.stderr)
         return 2
-    run_id, reviewer = args
-    if reviewer not in MODEL_REVIEWERS:
-        print("Usage: 3p.py reviewer-role <run-id> <codex|gemini>", file=sys.stderr)
+    run_id, reviewer, review_type = args
+    if reviewer not in MODEL_REVIEWERS or review_type not in REVIEW_TYPES:
+        print(usage, file=sys.stderr)
         return 2
     anchor, _ = find_anchor()
     state = read_state(run_dir_path(anchor, run_id))
     cfg = normalize_config(state.get("resolvedConfig", {}))
     power = cfg["modelPower"]
-    model_name = cfg["models"][reviewer][power]
+    model_name = cfg["models"][reviewer][power][review_type]
     install_pal_config(cfg)
-    print(stable_model_role_name(power, reviewer, model_name))
+    print(stable_model_role_name(power, reviewer, review_type, model_name))
     return 0
 
 
@@ -496,10 +553,16 @@ DEFAULT_CLI_CLIENTS = {
             },
         },
     },
-    "gemini": {
-        "name": "gemini",
-        "command": "gemini",
-        "additional_args": ["--yolo"],
+    "antigravity": {
+        # The Antigravity reviewer talks to PAL as `agy`. PAL's `agy` internal
+        # defaults already inject `--dangerously-skip-permissions` for
+        # non-interactive auto-approval, so it is deliberately NOT repeated here
+        # (it would be passed twice). additional_args is left empty by default;
+        # users may add `agy` flags (e.g. --add-dir) and install_pal_config
+        # preserves them.
+        "name": "agy",
+        "command": "agy",
+        "additional_args": [],
         "env": {},
         "roles": {
             "default": {
@@ -519,8 +582,14 @@ DEFAULT_CLI_CLIENTS = {
 }
 
 
+def cli_client_path(reviewer: str) -> Path:
+    """PAL cli_clients file for a 3p reviewer key (antigravity -> agy.json)."""
+    cli_name = REVIEWER_CLI[reviewer]
+    return Path.home() / ".pal" / "cli_clients" / f"{cli_name}.json"
+
+
 def load_cli_client_config(reviewer: str) -> dict:
-    path = Path.home() / ".pal" / "cli_clients" / f"{reviewer}.json"
+    path = cli_client_path(reviewer)
     if path.exists():
         try:
             return json.loads(path.read_text())
@@ -530,29 +599,34 @@ def load_cli_client_config(reviewer: str) -> dict:
 
 
 def write_cli_client_config(reviewer: str, data: dict) -> None:
-    path = Path.home() / ".pal" / "cli_clients" / f"{reviewer}.json"
+    path = cli_client_path(reviewer)
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_json(path, data)
 
 
 def install_pal_config(cfg: dict) -> None:
     for reviewer in sorted(MODEL_REVIEWERS):
+        cli_name = REVIEWER_CLI[reviewer]
         client = load_cli_client_config(reviewer)
-        client["name"] = reviewer
-        client.setdefault("command", reviewer)
+        # PAL binds its output parser to the cli `name`, which must be one of
+        # PAL's supported names — so write the PAL cli_name, not the 3p key.
+        client["name"] = cli_name
+        client.setdefault("command", cli_name)
         client.setdefault("additional_args", [])
         client.setdefault("env", {})
         roles = client.setdefault("roles", {})
         base_role = roles.get("codereviewer") or DEFAULT_CLI_CLIENTS[reviewer]["roles"]["codereviewer"]
         prompt_path = base_role.get("prompt_path") or DEFAULT_CLI_CLIENTS[reviewer]["roles"]["codereviewer"]["prompt_path"]
         for power in sorted(MODEL_POWERS):
-            model_name = cfg["models"][reviewer][power]
-            role = {
-                "prompt_path": prompt_path,
-                "role_args": ["--model", model_name],
-            }
-            roles[reviewer_role_name(power)] = role
-            roles[stable_model_role_name(power, reviewer, model_name)] = role
+            for review_type in sorted(REVIEW_TYPES):
+                model_name = cfg["models"][reviewer][power][review_type]
+                role = {
+                    "prompt_path": prompt_path,
+                    "role_args": ["--model", model_name],
+                }
+                roles[reviewer_role_name(power, review_type)] = role
+                roles[stable_model_role_name(
+                    power, reviewer, review_type, model_name)] = role
         write_cli_client_config(reviewer, client)
 
 
@@ -604,8 +678,8 @@ Subcommands:
   config-load
   model-power [low|high]
   models [list]
-  models set <codex|gemini> <low|high> <model>
-  reviewer-role <run-id> <codex|gemini>
+  models set <codex|antigravity> <low|high> <reasoning|code> <model>
+  reviewer-role <run-id> <codex|antigravity> <reasoning|code>
   pal-config install
   update
   state-read <run-id> <key>

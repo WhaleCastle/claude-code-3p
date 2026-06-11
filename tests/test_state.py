@@ -45,12 +45,22 @@ def test_init_persists_model_power_and_reviewer_role(script_path, tmp_git_repo, 
     assert state["resolvedConfig"]["modelPower"] == "low"
     fake_home = tmp_path / "home"
     env = {"HOME": str(fake_home), "PATH": "/usr/bin:/bin"}
-    role = run_3p(script_path, tmp_git_repo, "reviewer-role", "x-20260603-1430", "gemini", env=env)
+    role = run_3p(script_path, tmp_git_repo, "reviewer-role", "x-20260603-1430",
+                  "antigravity", "reasoning", env=env)
     assert role.returncode == 0, role.stderr
     role_name = role.stdout.strip()
-    assert role_name.startswith("codereviewer-low-")
-    gemini_pal = json.loads((fake_home / ".pal" / "cli_clients" / "gemini.json").read_text())
-    assert gemini_pal["roles"][role_name]["role_args"] == ["--model", "flash"]
+    assert role_name.startswith("codereviewer-low-reasoning-")
+    # antigravity is stored under its PAL cli_name, agy.json.
+    agy_pal = json.loads((fake_home / ".pal" / "cli_clients" / "agy.json").read_text())
+    assert agy_pal["roles"][role_name]["role_args"] == ["--model", "Gemini 3.1 Pro (Low)"]
+    # The code-review slot resolves to the Flash model instead.
+    code_role = run_3p(script_path, tmp_git_repo, "reviewer-role", "x-20260603-1430",
+                       "antigravity", "code", env=env)
+    assert code_role.returncode == 0, code_role.stderr
+    code_name = code_role.stdout.strip()
+    assert code_name.startswith("codereviewer-low-code-")
+    agy_pal = json.loads((fake_home / ".pal" / "cli_clients" / "agy.json").read_text())
+    assert agy_pal["roles"][code_name]["role_args"] == ["--model", "Gemini 3.5 Flash (Low)"]
 
 
 def test_init_bootstraps_gitignore(script_path, tmp_git_repo):
@@ -87,7 +97,7 @@ def test_availability_log_appends(script_path, tmp_git_repo):
     run_3p(script_path, tmp_git_repo, "init", "x", "20260603-1430")
     e1 = {"phase": "plan", "step": None, "round": 1, "reviewer": "codex",
           "status": "responded", "durationSeconds": 47}
-    e2 = {"phase": "plan", "step": None, "round": 1, "reviewer": "gemini",
+    e2 = {"phase": "plan", "step": None, "round": 1, "reviewer": "antigravity",
           "status": "unavailable", "reason": "timeout", "durationSeconds": 120}
     run_3p(script_path, tmp_git_repo, "availability-append", "x-20260603-1430",
            json.dumps(e1))

@@ -35,12 +35,12 @@ def test_round_write_plan(script_path, tmp_git_repo):
 
 def test_round_write_step(script_path, tmp_git_repo):
     run_3p(script_path, tmp_git_repo, "init", "x", "20260603-1430")
-    verdicts = {"reviewer": "gemini", "status": "approved", "findings": [],
+    verdicts = {"reviewer": "antigravity", "status": "approved", "findings": [],
                 "rebuttals": [], "durationSeconds": 30}
     r = run_3p(script_path, tmp_git_repo, "round-write", "x-20260603-1430",
-               "build", "2", "1", "gemini", json.dumps(verdicts))
+               "build", "2", "1", "antigravity", json.dumps(verdicts))
     assert r.returncode == 0
-    f = tmp_git_repo / ".3p" / "x-20260603-1430" / "step-2-round-1-gemini.md"
+    f = tmp_git_repo / ".3p" / "x-20260603-1430" / "step-2-round-1-antigravity.md"
     assert f.exists()
     assert "APPROVED" in f.read_text()
 
@@ -53,17 +53,17 @@ def test_round_write_per_reviewer_files(script_path, tmp_git_repo):
                         "location": "L", "issue": "I", "rationale": "R",
                         "verdict": "accepted", "verdictReason": "valid"}],
           "rebuttals": [], "durationSeconds": 47}
-    v2 = {"reviewer": "gemini", "status": "approved", "findings": [],
+    v2 = {"reviewer": "antigravity", "status": "approved", "findings": [],
           "rebuttals": [], "durationSeconds": 30}
     run_3p(script_path, tmp_git_repo, "round-write", "x-20260603-1430",
            "plan", "-", "1", "codex", json.dumps(v1))
     run_3p(script_path, tmp_git_repo, "round-write", "x-20260603-1430",
-           "plan", "-", "1", "gemini", json.dumps(v2))
+           "plan", "-", "1", "antigravity", json.dumps(v2))
     run_dir = tmp_git_repo / ".3p" / "x-20260603-1430"
     codex_md = (run_dir / "plan-round-1-codex.md").read_text()
-    gemini_md = (run_dir / "plan-round-1-gemini.md").read_text()
+    antigravity_md = (run_dir / "plan-round-1-antigravity.md").read_text()
     assert "C1" in codex_md
-    assert "APPROVED" in gemini_md
+    assert "APPROVED" in antigravity_md
 
 
 def test_round_write_with_rebuttals(script_path, tmp_git_repo):
