@@ -8,6 +8,12 @@ Review ONLY the plan provided below, and only as it pertains to the task above. 
 
 {{task}}
 
+# Goal (north-star)
+
+{{north_star}}
+
+Also flag, as an `[Important]` finding, anything in the plan below that does not serve this goal, or any scope silently added or dropped relative to it.
+
 # Plan to review
 
 {{plan}}

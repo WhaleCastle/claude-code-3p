@@ -8,6 +8,12 @@ Review ONLY the cumulative diff and artifacts provided below, and only as they p
 
 {{task}}
 
+# Goal (north-star)
+
+{{north_star}}
+
+Also flag, as an `[Important]` finding, anything in the cumulative diff that does not serve this goal, or any scope silently added or dropped relative to it across the whole build.
+
 # Approved plan
 
 {{plan}}

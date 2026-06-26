@@ -381,6 +381,13 @@ def cmd_init(args: list) -> int:
         "pausedReason": None,
         "resolvedConfig": resolved_cfg,
         "availabilityLog": [],
+        # Interface/observability layer (additive). northStar: one-line goal the
+        # dashboard and reviewers anchor to. alignment: latest per-phase drift
+        # self-check. ledger: stable-id findings + pushback-rebuttal log; all
+        # readers use .get/.setdefault so runs predating these keys never crash.
+        "northStar": None,
+        "alignment": {"status": "unknown", "note": "", "checkedAtPhase": None},
+        "ledger": {"nextId": 1, "findings": [], "rebuttals": []},
     }
     write_state(run_dir, state)
     if is_git:
@@ -689,6 +696,7 @@ Subcommands:
   snapshot diff <run-id> <key>
   parse-response <file>
   round-write <run-id> <phase> <step|-> <round> <reviewer> <verdicts-json>
+  dashboard <run-id>
   summary <run-id>
   consolidate-final <run-id>
   list
@@ -1487,6 +1495,126 @@ def normalize_verdicts(v, reviewer: str) -> dict:
     return v
 
 
+def scope_for(phase: str, step: str) -> str:
+    """The canonical review-scope id used by the ledger and dashboard.
+    plan -> 'plan'; build step N -> 'step-N'; final -> 'final'. Mirrors the
+    round-file naming so a finding's scope lines up with currentScope."""
+    if phase == "build":
+        return f"step-{step}"
+    if phase == "final":
+        return "final"
+    return "plan"
+
+
+def _normalize_finding_key(location: str, title: str) -> str:
+    """Dedup key for 're-raised same finding' detection. Lowercased, markdown-
+    stripped, whitespace-collapsed location+title. Two rounds raising the same
+    issue (even if the reviewer reworded asterisks/backticks/spacing) collapse to
+    one ledger entry; a genuinely different title or location stays separate."""
+    raw = f"{location or ''} {title or ''}"
+    raw = raw.replace("*", "").replace("`", "").replace("_", "")
+    return re.sub(r"\s+", " ", raw).strip().lower()
+
+
+def _ledger_upsert(state: dict, scope: str, rnd: int, v: dict) -> None:
+    """Fold one reviewer's round verdicts into state['ledger'] (idempotent per
+    (scope, reviewer, normalized-finding) across rounds). Resilient to runs that
+    predate the ledger via setdefault. No-op-safe for approved/unavailable
+    rounds (no findings). Rebuttal outcomes are always recorded for pushback W/L."""
+    ledger = state.setdefault("ledger", {"nextId": 1, "findings": [], "rebuttals": []})
+    ledger.setdefault("nextId", 1)
+    ledger.setdefault("findings", [])
+    ledger.setdefault("rebuttals", [])
+    reviewer = v.get("reviewer", "")
+    duration = v.get("durationSeconds", 0)
+    for f in v.get("findings", []) or []:
+        key = _normalize_finding_key(f.get("location", ""), f.get("title", ""))
+        entry = next(
+            (e for e in ledger["findings"]
+             if e.get("scope") == scope and e.get("reviewer") == reviewer
+             and _normalize_finding_key(e.get("location", ""), e.get("title", "")) == key),
+            None,
+        )
+        hist = {
+            "round": rnd,
+            "verdict": f.get("verdict", ""),
+            "verdictReason": f.get("verdictReason", ""),
+            "durationSeconds": duration,
+        }
+        if entry is None:
+            ledger["findings"].append({
+                "id": f"F-{ledger['nextId']:02d}",
+                "scope": scope,
+                "reviewer": reviewer,
+                "severity": f.get("severity", ""),
+                "title": f.get("title", ""),
+                "location": f.get("location", ""),
+                "status": f.get("verdict", ""),
+                "firstRound": rnd,
+                "lastRound": rnd,
+                "history": [hist],
+            })
+            ledger["nextId"] += 1
+        else:
+            # Idempotent per round: re-running round-write for the same round
+            # (retry / resume) must update that round's history item in place,
+            # not append a duplicate that would overcount the review event.
+            existing_hist = next(
+                (h for h in entry["history"] if h.get("round") == rnd), None)
+            if existing_hist is not None:
+                existing_hist.update(hist)
+            else:
+                entry["history"].append(hist)
+            entry["lastRound"] = max(entry.get("lastRound", rnd), rnd)
+            entry["status"] = f.get("verdict", entry.get("status", ""))
+            # Refresh descriptive fields to the latest wording.
+            entry["severity"] = f.get("severity", entry.get("severity", ""))
+            entry["title"] = f.get("title", entry.get("title", ""))
+            entry["location"] = f.get("location", entry.get("location", ""))
+    # Replace (not merely augment) this (scope, reviewer, round) contribution: a
+    # re-run of round-write for the same round with a finding DROPPED — a
+    # correction, or a later approved/empty write — must remove that finding's
+    # round-`rnd` history so no phantom finding lingers in the ledger (final-phase
+    # integration review). Findings keep their stable id and any earlier-round
+    # history; an entry left with no history at all is dropped entirely.
+    new_keys = {
+        _normalize_finding_key(f.get("location", ""), f.get("title", ""))
+        for f in v.get("findings", []) or []
+    }
+    for entry in list(ledger["findings"]):
+        if (entry.get("scope") != scope or entry.get("reviewer") != reviewer
+                or _normalize_finding_key(entry.get("location", ""),
+                                          entry.get("title", "")) in new_keys):
+            continue
+        kept = [h for h in entry["history"] if h.get("round") != rnd]
+        if len(kept) == len(entry["history"]):
+            continue  # had no contribution at round rnd; leave it untouched
+        if not kept:
+            ledger["findings"].remove(entry)
+        else:
+            entry["history"] = kept
+            entry["lastRound"] = max(h.get("round", 0) for h in kept)
+            entry["status"] = max(
+                kept, key=lambda h: h.get("round", 0)).get("verdict", entry.get("status", ""))
+    rebuttals = v.get("rebuttals", []) or []
+    if rebuttals:
+        # Same idempotency guarantee for rebuttals: drop any already-recorded for
+        # this (reviewer, scope, round) before re-appending this round's set.
+        ledger["rebuttals"] = [
+            r for r in ledger["rebuttals"]
+            if not (r.get("reviewer") == reviewer and r.get("scope") == scope
+                    and r.get("round") == rnd)
+        ]
+        for r in rebuttals:
+            ledger["rebuttals"].append({
+                "reviewer": reviewer,
+                "scope": scope,
+                "round": rnd,
+                "originalTitle": r.get("originalTitle", ""),
+                "outcome": r.get("outcome", ""),
+            })
+
+
 def cmd_round_write(args: list) -> int:
     if len(args) != 6:
         print("Usage: 3p.py round-write <run-id> <phase> <step|-> <round> <reviewer> <verdicts-json>",
@@ -1514,6 +1642,307 @@ def cmd_round_write(args: list) -> int:
     )
     section = render_reviewer_section(v)
     path.write_text(header + "\n" + section + "\n")
+    # Fold this round's findings/rebuttals into the persistent ledger. Done after
+    # the markdown write so a ledger hiccup never costs the audit-trail file; the
+    # round file remains the source of truth and the ledger is a derived index.
+    mutate_state(run_dir, lambda s: _ledger_upsert(s, scope_for(phase, step), rnd, v))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Interface/observability rendering (dashboard + scoreboard + ledger views).
+# All helpers are pure reads of state.json + run dir; safe to call any time and
+# defensive against runs that predate the ledger/alignment/northStar keys.
+# ---------------------------------------------------------------------------
+
+def _review_type_for_phase(phase: str) -> str:
+    """Phase B (build) is code review; plan and final are reasoning review."""
+    return "code" if phase == "build" else "reasoning"
+
+
+def _availability_scope(entry: dict) -> str:
+    """Map an availabilityLog entry to the same scope id the ledger uses."""
+    ph = entry.get("phase", "")
+    if ph == "build":
+        return f"step-{entry.get('step')}"
+    if ph == "final":
+        return "final"
+    return "plan"
+
+
+def _responded_in_scope_since(reviewer: str, scope: str, min_round: int,
+                              availability_log: list) -> bool:
+    """True if this reviewer `responded` for the scope at a round >= min_round.
+    Conflict detection uses min_round = the open finding's round so a stale
+    earlier approval (which never saw the current revision) is not reported as a
+    clean opposing review — it stays a coverage gap until the reviewer responds
+    again for the newer round (step-2 R2)."""
+    for a in availability_log or []:
+        if (_availability_scope(a) == scope and a.get("reviewer") == reviewer
+                and a.get("status") == "responded"):
+            try:
+                rnd = int(a.get("round", 0))
+            except (TypeError, ValueError):
+                rnd = 0
+            if rnd >= min_round:
+                return True
+    return False
+
+
+def _finding_is_open(entry: dict, availability_log: list) -> bool:
+    """Timing-independent open test (plan-phase reviewer consensus, R1): a finding
+    is open unless the SAME reviewer has `responded` in a LATER round for that
+    scope (which re-reviewed the revised artifact and did not re-raise it). This
+    does not compare against currentRound (incremented before reviewers reply) and
+    keeps a finding open across rounds where its reviewer was unavailable."""
+    scope = entry.get("scope")
+    reviewer = entry.get("reviewer")
+    last = entry.get("lastRound", 0)
+    for a in availability_log or []:
+        if (_availability_scope(a) == scope and a.get("reviewer") == reviewer
+                and a.get("status") == "responded"):
+            try:
+                rnd = int(a.get("round", 0))
+            except (TypeError, ValueError):
+                rnd = 0
+            if rnd > last:
+                return False
+    return True
+
+
+def _scoreboard(state: dict) -> dict:
+    """Per-reviewer aggregates derived from the ledger + availabilityLog.
+    Latency comes from PAL's metadata.duration_seconds (recorded into the log),
+    not Claude wall-clock (parallel tool calls are atomic — plan-phase R1)."""
+    cfg = state.get("resolvedConfig", {}) or {}
+    models = cfg.get("models", {}) or {}
+    power = cfg.get("modelPower", "high")
+    rt = _review_type_for_phase(state.get("phase", "plan"))
+    ledger = state.get("ledger") or {}
+    findings = ledger.get("findings", []) or []
+    rebuttals = ledger.get("rebuttals", []) or []
+    log = state.get("availabilityLog", []) or []
+    res = {}
+    for r in ("codex", "antigravity"):
+        rf = [e for e in findings if e.get("reviewer") == r]
+        durs = [a.get("durationSeconds", 0) for a in log
+                if a.get("reviewer") == r and a.get("status") == "responded"
+                and isinstance(a.get("durationSeconds"), (int, float))]
+        last = [a for a in log if a.get("reviewer") == r]
+        avail = "⚪ —"
+        if last:
+            avail = "🟢 up" if last[-1].get("status") == "responded" else "🔴 down"
+        try:
+            model = models.get(r, {}).get(power, {}).get(rt, "?")
+        except AttributeError:
+            model = "?"
+        res[r] = {
+            "model": model or "?",
+            "avail": avail,
+            "latency": f"{round(sum(durs) / len(durs))}s" if durs else "—",
+            "raised": len(rf),
+            "accepted": sum(1 for e in rf if e.get("status") == "accepted"),
+            "rejected": sum(1 for e in rf if e.get("status") == "rejected"),
+            "ignored": sum(1 for e in rf if e.get("status") == "ignored"),
+            "win": sum(1 for x in rebuttals
+                       if x.get("reviewer") == r and x.get("outcome") == "now-accepted"),
+            "loss": sum(1 for x in rebuttals if x.get("reviewer") == r
+                        and x.get("outcome") in ("withdrawn", "sustained")),
+        }
+    return res
+
+
+def render_scoreboard_table(state: dict) -> list:
+    sb = _scoreboard(state)
+    lines = [
+        "| Reviewer | Model | Now | Avg latency | Raised | ✓Acc | ✗Rej | –Ign | Pushback W/L |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for r in ("codex", "antigravity"):
+        s = sb[r]
+        lines.append(
+            f"| {REVIEWER_LABEL[r]} | {s['model']} | {s['avail']} | {s['latency']} | "
+            f"{s['raised']} | {s['accepted']} | {s['rejected']} | {s['ignored']} | "
+            f"{s['win']}/{s['loss']} |"
+        )
+    return lines
+
+
+def render_ledger_table(state: dict) -> list:
+    ledger = state.get("ledger") or {}
+    findings = ledger.get("findings", []) or []
+    if not findings:
+        return ["_No findings recorded._"]
+    log = state.get("availabilityLog", []) or []
+    lines = [
+        "| ID | Scope | Sev | Title | Reviewer | Status | Open? | Rounds |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for e in findings:
+        rounds = ",".join(str(h.get("round")) for h in e.get("history", []))
+        # Surface open/closed explicitly so the summary (and dashboard) never hide
+        # an unresolved finding behind a bare verdict like "accepted" — e.g. a
+        # finding left open by a round-cap exit (final-phase integration review).
+        openness = "🔴 open" if _finding_is_open(e, log) else "✅ closed"
+        lines.append(
+            f"| {e['id']} | {e.get('scope', '')} | {e.get('severity', '')} | "
+            f"{e.get('title', '')} | {REVIEWER_LABEL.get(e.get('reviewer'), e.get('reviewer'))} | "
+            f"{e.get('status', '')} | {openness} | {rounds} |"
+        )
+    return lines
+
+
+def _plan_step_count(run_dir: Path):
+    p = run_dir / "plan.md"
+    if not p.exists():
+        return "?"
+    nums = re.findall(r"(?mi)^#+\s*Step\s+(\d+)\b", p.read_text())
+    return max(int(n) for n in nums) if nums else "?"
+
+
+def _phase_progress(state: dict, step_count) -> str:
+    phase = state.get("phase", "plan")
+    idx = (state.get("currentStep") or {}).get("index")
+    plan_m = "✓" if phase in ("build", "final", "done") else ("▶" if phase == "plan" else "·")
+    if phase == "build":
+        build_m = f"▶ {idx if idx else '?'}/{step_count}"
+    elif phase in ("final", "done"):
+        build_m = "✓"
+    else:
+        build_m = "·"
+    final_m = "✓" if phase == "done" else ("▶" if phase == "final" else "·")
+    return f"[Plan {plan_m}] → [Build {build_m}] → [Final {final_m}]"
+
+
+def _align_badge(alignment: dict) -> str:
+    a = alignment or {}
+    status = a.get("status", "unknown")
+    emoji = {"green": "🟢", "yellow": "🟡", "red": "🔴"}.get(status, "❔")
+    note = a.get("note", "")
+    cp = a.get("checkedAtPhase")
+    tail = f" — {note}" if note else ""
+    cpt = f"  _(checked: {cp})_" if cp else ""
+    return f"{emoji} {status}{tail}{cpt}"
+
+
+def cmd_dashboard(args: list) -> int:
+    if len(args) != 1:
+        print("Usage: 3p.py dashboard <run-id>", file=sys.stderr)
+        return 2
+    run_id = args[0]
+    anchor, _ = find_anchor()
+    run_dir = run_dir_path(anchor, run_id)
+    state = read_state(run_dir)
+    cfg = state.get("resolvedConfig", {}) or {}
+    round_cap = cfg.get("roundCap", DEFAULTS["roundCap"])
+    phase = state.get("phase", "plan")
+    scope = state.get("currentScope")
+    if not scope:
+        # Fall back to the canonical scope for the phase so plan/final phases and
+        # legacy runs predating currentScope never render "Scope None" with empty
+        # open-findings/agreement sections.
+        if phase == "final":
+            scope = "final"
+        elif phase == "build":
+            idx = (state.get("currentStep") or {}).get("index")
+            scope = f"step-{idx}" if idx is not None else "plan"
+        else:
+            scope = "plan"
+    cur_round = state.get("currentRound", 0)
+    north = state.get("northStar") or "_(not set)_"
+    ledger = state.get("ledger") or {}
+    findings = ledger.get("findings", []) or []
+    log = state.get("availabilityLog", []) or []
+    step_count = _plan_step_count(run_dir)
+
+    out = [
+        f"# /3p Dashboard — {state.get('taskSlug', '')} · {run_id}",
+        "",
+        f"🎯 **Goal:** {north}",
+        "",
+        f"**Progress:** {_phase_progress(state, step_count)}  ·  Round {cur_round}/{round_cap}"
+        f"  ·  Scope `{scope}`",
+        f"**Alignment:** {_align_badge(state.get('alignment'))}",
+        "",
+        "## Reviewers",
+        "",
+    ]
+    out += render_scoreboard_table(state)
+
+    open_f = [e for e in findings if e.get("scope") == scope and _finding_is_open(e, log)]
+    out += ["", f"## Open findings — `{scope}`", ""]
+    if open_f:
+        out += ["| ID | Sev | Title | Reviewer | Status |", "|---|---|---|---|---|"]
+        for e in open_f:
+            out.append(
+                f"| {e['id']} | {e.get('severity', '')} | {e.get('title', '')} | "
+                f"{REVIEWER_LABEL.get(e.get('reviewer'), e.get('reviewer'))} | "
+                f"{e.get('status', '')} |"
+            )
+    else:
+        out.append("_None open in the current scope._")
+
+    # Agreement / conflict — independent reviewers flagging the same location is a
+    # high-confidence signal; one approving while the other has open findings is a
+    # conflict worth surfacing.
+    out += ["", "## Agreement / conflict", ""]
+    scope_findings = [e for e in findings if e.get("scope") == scope]
+    by_loc = {}
+    for e in scope_findings:
+        loc = re.sub(r"\s+", " ", (e.get("location", "") or "")).strip().lower()
+        if loc:
+            by_loc.setdefault(loc, []).append(e)
+    agreed = False
+    for loc, group in by_loc.items():
+        reviewers = {e.get("reviewer") for e in group}
+        if len(reviewers) > 1:
+            agreed = True
+            ids = ", ".join(e["id"] for e in group)
+            out.append(f"- ✓ **Both flagged** `{group[0].get('location')}` ({ids}) — high confidence")
+    reviewers_with_open = {e.get("reviewer") for e in open_f}
+    if len(reviewers_with_open) == 1:
+        has = next(iter(reviewers_with_open))
+        other = "antigravity" if has == "codex" else "codex"
+        n = sum(1 for e in open_f if e.get("reviewer") == has)
+        open_round = max((e.get("lastRound", 0) for e in open_f), default=0)
+        if _responded_in_scope_since(other, scope, open_round, log):
+            # The other reviewer actually reviewed this scope and is clean — a
+            # genuine disagreement between the two reviewers.
+            out.append(
+                f"- ⚠ **Conflict:** {REVIEWER_LABEL.get(other, other)} approved (no open findings) "
+                f"while {REVIEWER_LABEL.get(has, has)} has {n} open in `{scope}`"
+            )
+        else:
+            # The other reviewer has not returned a review for this scope; do NOT
+            # imply it approved (it may be unavailable or not run yet).
+            out.append(
+                f"- ⚠ **Coverage gap:** {REVIEWER_LABEL.get(has, has)} has {n} open in `{scope}`; "
+                f"{REVIEWER_LABEL.get(other, other)} has not returned a review for this scope yet"
+            )
+    elif not agreed:
+        out.append("_No cross-reviewer agreement or conflict in the current scope._")
+
+    # Full findings ledger (all scopes) — stable IDs, status, and round history,
+    # so the dashboard reflects the whole run at a glance, not just the live scope.
+    out += ["", "## Findings ledger (all scopes)", ""]
+    out += render_ledger_table(state)
+
+    # Last activity
+    out += ["", "## Last activity", ""]
+    if log:
+        a = log[-1]
+        out.append(
+            f"- {a.get('phase', '')} {(a.get('step') or '-')} round {a.get('round', '')}: "
+            f"{REVIEWER_LABEL.get(a.get('reviewer'), a.get('reviewer'))} "
+            f"{a.get('status', '')}"
+            + (f" ({a.get('reason')})" if a.get("reason") else "")
+            + (f", {a.get('durationSeconds')}s" if a.get("durationSeconds") else "")
+        )
+    out.append(f"- Open findings in scope: {len(open_f)}")
+    out.append("")
+
+    (run_dir / "dashboard.md").write_text("\n".join(out))
+    print(str(run_dir / "dashboard.md"))
     return 0
 
 
@@ -1550,6 +1979,15 @@ def cmd_summary(args: list) -> int:
     ]
     for s in step_summaries:
         out += [f"### {s.name}", "", s.read_text().strip(), ""]
+    # Observability roll-up — same helpers the live dashboard uses, so the
+    # end-of-run summary and the dashboard can never diverge.
+    out += ["## Goal-alignment", "",
+            f"- {_align_badge(state.get('alignment'))}", ""]
+    out += ["## Reviewer scoreboard", ""]
+    out += render_scoreboard_table(state)
+    out += ["", "## Findings ledger", ""]
+    out += render_ledger_table(state)
+    out += [""]
     out += ["## Round-by-round audit trail", ""]
     for r in rounds:
         out += [f"### {r.name}", "", r.read_text().strip(), ""]
@@ -1735,6 +2173,7 @@ def main(argv: list) -> int:
         "snapshot": cmd_snapshot,
         "parse-response": cmd_parse_response,
         "round-write": cmd_round_write,
+        "dashboard": cmd_dashboard,
         "summary": cmd_summary,
         "consolidate-final": cmd_consolidate_final,
         "list": cmd_list,

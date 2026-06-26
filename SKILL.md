@@ -66,7 +66,8 @@ When invoked with a task description (no `--resume`):
 2. Compute timestamp: `ts=$(date +%Y%m%d-%H%M)`
 3. Initialize run, forwarding any user-supplied `--config <path>` and `--exclude <pattern>` flags exactly once: `3PSH init "$slug" "$ts" [--config <path>] [--exclude <pat>]...`. This creates `.3p/<run-id>/`, persists the resolved configuration to `state.resolvedConfig`, writes the stub state, and bootstraps `.gitignore`. **Verify the constructed git ref path** — if `init` aborts because `git check-ref-format` rejected it, surface the error to the user and stop. Capture the `<run-id>` from stdout on success.
 4. Save the original task: write user's task description verbatim to `.3p/<run-id>/task.txt`
-5. Announce in chat: `→ Started /3p run: <run-id>`
+5. **Capture the north-star.** Distill the task into ONE plain-language sentence naming the goal and its definition of done, and persist it: `3PSH state-write <run-id> northStar '"<one-line goal>"'`. This is the anchor every reviewer prompt and the dashboard use for drift detection — keep it concrete and outcome-focused, not a restatement of the steps.
+6. Announce in chat: `→ Started /3p run: <run-id>`
 
 When invoked with `--resume`:
 
@@ -94,15 +95,27 @@ Keep the user continuously informed — they should never be left waiting withou
 - Exit conditions: `Phase A complete: unanimous approval at round N` or `Phase A: round cap reached, see summary`
 - Reviewer availability: `⚠ <reviewer> timeout — continuing with <other> only this round`
 - Both-down pauses: surface the full menu and wait for user input
+- **Dashboard refresh:** after every round (once both round files are written), run `3PSH dashboard <run-id>` and surface the path once per phase: `dashboard: .3p/<run-id>/dashboard.md (keep open to follow progress)`. The dashboard is the persistent at-a-glance view (phase progress, per-model scoreboard, open findings, agreement/conflict, alignment); the chat lines are the live narration.
 
-Do NOT dump full reviewer outputs to chat; they go to round files. Do NOT dump diffs to chat. The per-finding lines above are short summaries (severity + title + your verdict + a one-line reason), NOT the reviewer's raw text.
+**Compact HUD block.** Bracket every round with a one-glance status block so the chat has rhythm instead of a flat trickle — print it at the **start** and **end** of each round, with the per-finding lines in between:
+
+```
+┌ /3p <run-id> · Phase B step 2/5 · Round 3/10 · Alignment 🟢
+│ codex 🟢 14s · antigravity 🟢 22s · open findings: 1 · F-07 [Critical] open
+└
+```
+
+Derive the fields from `state.json` (phase/step/round/cap/alignment) and the latest round/ledger data. Keep it to ≤3 lines. Do NOT dump full reviewer outputs to chat; they go to round files. Do NOT dump diffs to chat. The per-finding lines above are short summaries (severity + title + your verdict + a one-line reason), NOT the reviewer's raw text.
+
+> **Per-phase alignment self-check (drift signal).** At the start of Phase A, the start of EACH Phase B step, and the start of Phase C, judge whether the current artifact still serves the north-star and record it: `3PSH state-write <run-id> alignment '{"status":"green|yellow|red","note":"<what changed / any scope added or dropped>","checkedAtPhase":"<plan|build-step-N|final>"}'`. `green` = on-track; `yellow` = minor drift/scope ambiguity worth flagging; `red` = materially off-goal (surface to the user before continuing). The value drives the dashboard `Alignment:` indicator and the summary's Goal-alignment section.
 
 ## Phase A: Plan
 
 1. Set phase: `3PSH state-write <run-id> phase '"plan"'`
 2. **Write the plan** to `.3p/<run-id>/plan.md`. The plan MUST contain numbered Steps (Step 1, Step 2, …) — even a one-step task has Step 1. Each step has: goal, expected files touched, acceptance criteria, optional `testCommand`.
-3. **Run review loop** with `plan-review.md` template and broader severity bar. See Review Loop § below.
-4. On approved exit OR cap-reached exit, set `phase=build` and proceed to Phase B.
+3. **Alignment self-check** (see box above): now that the plan exists, judge whether *it* serves the north-star and write `state.alignment` with `checkedAtPhase: "plan"`. (Run the check on the produced artifact, not before it exists.)
+4. **Run review loop** with `plan-review.md` template and broader severity bar. See Review Loop § below.
+5. On approved exit OR cap-reached exit, set `phase=build` and proceed to Phase B.
 
 ## Phase B: Build (per step)
 
@@ -115,11 +128,12 @@ Before the first step: capture the **pre-build baseline ONCE**.
 For each step N declared in the plan:
 
 1. Capture step baseline: check `3PSH state-read <run-id> baselines`. **If `step-N` is already present** (resume after the step's baseline was captured but before implementation finished), SKIP this capture — overwriting it with a partially-implemented working tree would silently drop half the step's changes from the reviewer diff. Otherwise: `3PSH snapshot capture <run-id> step-N`. The same guard semantics apply as for pre-build: never re-capture an existing baseline; only capture if absent.
-2. Record current step: `3PSH state-write <run-id> currentStep '{"index": N, "description": "...", "testCommand": "..."}'`
+2. Record current step: `3PSH state-write <run-id> currentStep '{"index": N, "description": "...", "testCommand": "..."}'`.
 3. **Implement step N.** Edit files per the plan. Use Read/Edit/Write tools as normal.
 4. **Run the step's test command** if declared. Capture stdout/stderr/exit-code into `.3p/<run-id>/step-N-test.txt`. If no command, write the file with the literal content `no tests run for this step` so Phase C can detect this uniformly. The test command runs in the anchor directory.
-5. **Run review loop** with `step-review.md` template, tighter severity bar, the step's diff (`3PSH snapshot diff <run-id> step-N`), and the test output (read `step-N-test.txt`).
-6. On exit:
+5. **Alignment self-check** (see box above): now that the step is implemented and tested, judge whether *the produced change* still serves the north-star and write `state.alignment` with `checkedAtPhase: "build-step-N"`. (Check the artifact you just made, not the pre-edit state.)
+6. **Run review loop** with `step-review.md` template, tighter severity bar, the step's diff (`3PSH snapshot diff <run-id> step-N`), and the test output (read `step-N-test.txt`).
+7. On exit:
    - Compute sub-summary (counts of findings/verdicts, files touched, notable items)
    - Write `.3p/<run-id>/step-N-summary.md` with the sub-summary
    - Display the sub-summary in chat
@@ -127,7 +141,7 @@ For each step N declared in the plan:
 
 ## Phase C: Final review
 
-1. Set phase: `3PSH state-write <run-id> phase '"final"'`
+1. Set phase: `3PSH state-write <run-id> phase '"final"'`. Then do the **alignment self-check** (see box above) with `checkedAtPhase: "final"` — judge whether the whole build still serves the north-star (note any scope that drifted across the run).
 2. Build the cumulative diff: `3PSH snapshot diff <run-id> pre-build`. Save to `.3p/<run-id>/final-diff.txt` so the prompt and `final-review.md` can both reference it.
 3. Build the file list (changed + new): from the diff output, extract paths
 4. **Consolidate per-step test output:** read every `step-N-test.txt` file in run order. Concatenate them into one block prefixed with `=== step-N ===` headers and the per-step exit code. If a step has the literal `no tests run for this step` body, mark that step as "no tests" in the header. If NO step declared any test command across the whole run, the consolidated block is the single literal line `no tests run during build`. Save this to `.3p/<run-id>/final-test-output.txt` and pass it to the reviewer template as `{{test_output}}`.
@@ -150,7 +164,7 @@ Also write `state.currentScope` to one of: `"plan"`, `"step-N"`, `"final"`. On `
 For each round:
 
 1. Increment `state.currentRound`. Round files for this scope are named per the scope: `plan-round-N-<reviewer>.md`, `step-M-round-N-<reviewer>.md`, or `final-round-N-<reviewer>.md`. At scope start, do `3PSH state-write <run-id> currentRound 0` AND `3PSH state-write <run-id> currentScope '"<scope-id>"'`, then begin round 1.
-2. Build each reviewer's prompt by filling the relevant template:
+2. Build each reviewer's prompt by filling the relevant template. Fill `{{north_star}}` from `state.northStar` (`3PSH state-read <run-id> northStar`). **If it is empty/`None`/`null`** — a run resumed from before the north-star was captured, or a pre-upgrade run — **backfill it first:** distill `task.txt` into one sentence and `3PSH state-write <run-id> northStar '"<one-line goal>"'`, then use that value. Never pass an empty goal into a reviewer prompt (it makes drift detection meaningless).
    - For round 1: leave `{{rebuttal_section}}` empty
    - For round ≥ 2: include any rejected/ignored findings from prior rounds that the reviewer raised (each reviewer only sees its own), formatted as: "Last round you raised these findings that were not addressed: <list with verdicts and reasons>. If you still believe any are blocker/critical/important, push back with stronger evidence (point to specific code, cite a concrete failure mode). Otherwise drop them and review the latest artifact."
 3. **Run both reviewers in parallel**:
@@ -159,13 +173,15 @@ For each round:
    - Single message with two `mcp__pal__clink` calls. The PAL `cli_name` is **static per reviewer**: Codex → `cli_name=codex`; Antigravity → `cli_name=agy`. So call `cli_name=codex, role=<codex_role>` and `cli_name=agy, role=<agy_role>`.
    - Use the `continuation_id` from prior rounds to preserve cross-round context.
 
+   **Per-reviewer latency:** read each reviewer's wall-clock from the PAL `clink` result `metadata.duration_seconds` — NOT from your own timing. The two reviewers run as parallel tool calls in one atomic turn, so you cannot observe per-reviewer wall-clock yourself; PAL returns an accurate per-call value. Round it to an integer and use it as `durationSeconds` in BOTH `availability-append` and the `round-write` verdicts JSON. If the metadata is missing, record `0`.
+
    **Timeout handling:** `mcp__pal__clink` does not expose a per-call timeout parameter; it relies on the MCP framework's transport timeout (typically generous). The skill therefore treats timeout the practical way: read `state.resolvedConfig.timeoutSeconds` and note the **start** time of each call. If a `clink` call **errors** with a timeout/transport error from the framework, that reviewer is `unavailable` for the round. If a `clink` call **returns successfully** but the wall-clock time exceeded `timeoutSeconds` AND its response parses as `unavailable` (garbled), the same failure mode applies. The skill does NOT attempt to forcibly cancel an in-flight `clink` call. If a hang seems to be occurring (no progress for ≫ `timeoutSeconds × 3`), surface the situation to the user and wait for input — this is the "both-down" pause unless one reviewer already returned cleanly.
 
 4. For each reviewer's response:
    - Save the raw text to `.3p/<run-id>/<round-prefix>-<reviewer>.raw.txt`
    - Parse it: `3PSH parse-response <raw-file>` → JSON `{status, findings, raw?}`
    - If status is `unavailable` OR the `clink` call errored, mark the reviewer as having failed this round (record reason: `timeout` / `error` / `garbled`)
-   - Append an entry to the historical availability log: `3PSH availability-append <run-id> '<entry-json>'`. Entry shape: `{phase, step, round, reviewer, status: "responded"|"unavailable", reason?, durationSeconds}`. Call this for BOTH reviewers on every round, whether they responded or failed.
+   - Append an entry to the historical availability log: `3PSH availability-append <run-id> '<entry-json>'`. Entry shape: `{phase, step, round, reviewer, status: "responded"|"unavailable", reason?, durationSeconds}`. Set `durationSeconds` from the reviewer's `metadata.duration_seconds` (see Per-reviewer latency above). Call this for BOTH reviewers on every round, whether they responded or failed.
 5. **Detect failures.** Update `state.reviewerHealth.<reviewer>.consecutiveFailures` (increment on failure, reset to 0 on responded). If a reviewer hit `consecutiveFailuresForDowngrade`, **pause and surface the downgrade menu** (see Persistent-reviewer downgrade §).
 6. If **both** reviewers failed: pause and surface the both-down menu. Wait for user.
 7. **Verify findings.** For each available reviewer's findings, decide a verdict:
@@ -203,7 +219,7 @@ For each round:
     - **Approved exit:** **This round was fully attended** (both reviewers responded with structured output) **and both reviewers emitted the explicit `APPROVED` token** for the **current** artifact (the version revised after this round's accepted findings, if any). Exit phase. *Exception:* if user-authorized downgrade mode is active for the run, the working reviewer's APPROVED is sufficient.
     - **Continue:** Otherwise — if any `accepted` findings were applied this round (reviewers must see the revised artifact) OR any reviewer raised findings this round OR this round was not fully attended → proceed to the next round.
     - **Cap reached:** Round 10 finishes without an approved exit. Any remaining `accepted` findings are applied in one final no-review revision pass before exit. Cap-reached exit is recorded explicitly in the round file and surfaced in the final summary.
-11. After each round, display the transparency line in chat.
+11. **Refresh the dashboard:** after both round files are written, run `3PSH dashboard <run-id>` (regenerates `.3p/<run-id>/dashboard.md`). Then display the round's transparency lines and the compact HUD block in chat (see Transparency §). Surface the `dashboard.md` path at least once per phase so the user can keep it open.
 
 ## Persistent-reviewer downgrade (handle when triggered)
 
@@ -246,7 +262,7 @@ When both reviewers failed in the same round:
 
 On `--resume <slug>`:
 
-1. Read `state.json`. Use `phase` to decide which phase block to enter.
+1. Read `state.json`. Use `phase` to decide which phase block to enter. **Backfill the north-star if unset:** if `state.northStar` is empty/`None` (a pre-upgrade run, or one resumed before Phase 0 step 5 ran), distill `task.txt` into one sentence and `3PSH state-write <run-id> northStar '"<one-line goal>"'` before any reviewer round, so `{{north_star}}` is never empty.
 2. If `phase == "plan"`: read `plan.md` and continue the plan review loop from `currentRound + 1`.
 3. If `phase == "build"`: read `currentStep` and continue from where it left off (re-snapshot the step baseline only if not yet captured; otherwise reuse).
 4. If `phase == "final"`: continue the final review loop.

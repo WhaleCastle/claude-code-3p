@@ -8,6 +8,12 @@ Review ONLY the diff provided below for THIS step, and only as it pertains to th
 
 {{task}}
 
+# Goal (north-star)
+
+{{north_star}}
+
+Also flag, as an `[Important]` finding, anything in this step's diff that does not serve this goal, or any scope silently added or dropped relative to it.
+
 # Approved plan
 
 {{plan}}
