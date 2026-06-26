@@ -153,6 +153,75 @@ def test_dashboard_includes_full_ledger_section(script_path, tmp_git_repo):
     assert "open" in md           # this finding has no later responded round
 
 
+def test_dashboard_stdout_echoes_full_markdown(script_path, tmp_git_repo):
+    """--stdout prints the rendered markdown (so the skill can relay scoreboard +
+    ledger into chat) AND still writes the file; the two must match."""
+    run_3p(script_path, tmp_git_repo, "init", "x", "20260603-1430")
+    _state_write(script_path, tmp_git_repo, "currentScope", "step-1")
+    run_3p(script_path, tmp_git_repo, "round-write", RUN, "build", "1", "1", "codex",
+           json.dumps(_finding("Echoed", "e.py:1", "codex")))
+    r = run_3p(script_path, tmp_git_repo, "dashboard", RUN, "--stdout")
+    assert r.returncode == 0, r.stderr
+    assert "Findings ledger (all scopes)" in r.stdout
+    assert "F-01" in r.stdout and "Echoed" in r.stdout
+    assert r.stdout.rstrip("\n") == _dash(tmp_git_repo).rstrip("\n")   # stdout == file
+    # default (no flag) still prints just the path, not the markdown
+    r2 = run_3p(script_path, tmp_git_repo, "dashboard", RUN)
+    assert "dashboard.md" in r2.stdout
+    assert "Findings ledger" not in r2.stdout
+
+
+def test_hud_renders_compact_block(script_path, tmp_git_repo):
+    run_3p(script_path, tmp_git_repo, "init", "x", "20260603-1430")
+    _state_write(script_path, tmp_git_repo, "phase", "build")
+    _state_write(script_path, tmp_git_repo, "currentScope", "step-1")
+    _state_write(script_path, tmp_git_repo, "currentRound", 2)
+    _state_write(script_path, tmp_git_repo, "currentStep", {"index": 1, "description": "d"})
+    _state_write(script_path, tmp_git_repo, "alignment",
+                 {"status": "green", "note": "ok", "checkedAtPhase": "build-step-1"})
+    run_3p(script_path, tmp_git_repo, "round-write", RUN, "build", "1", "2", "codex",
+           json.dumps(_finding("Open one", "h.py:1", "codex")))
+    r = run_3p(script_path, tmp_git_repo, "hud", RUN)
+    assert r.returncode == 0, r.stderr
+    lines = r.stdout.strip().splitlines()
+    assert lines[0].startswith("┌ /3p " + RUN)
+    assert "Phase B step 1/" in lines[0]
+    assert "Round 2/10" in lines[0]
+    assert "Alignment 🟢" in lines[0]
+    assert "Codex" in lines[1] and "Antigravity" in lines[1]
+    assert "F-01 [Important] open" in lines[1]   # first open finding surfaced
+    assert lines[2] == "└"
+
+
+def test_hud_zero_open_findings(script_path, tmp_git_repo):
+    run_3p(script_path, tmp_git_repo, "init", "x", "20260603-1430")
+    r = run_3p(script_path, tmp_git_repo, "hud", RUN)
+    assert r.returncode == 0, r.stderr
+    assert "open findings: 0" in r.stdout
+    assert "Phase A Plan" in r.stdout       # plan-phase fallback label
+
+
+def test_hud_latency_shows_zero_not_stale(script_path, tmp_git_repo):
+    """A latest responded round with 0s latency (missing PAL metadata) must render
+    '0s' — consistent with the scoreboard — not fall through to an older round's
+    latency or '—'. Regression guard for the _last_latency truthiness bug."""
+    run_3p(script_path, tmp_git_repo, "init", "x", "20260603-1430")
+    _state_write(script_path, tmp_git_repo, "phase", "build")
+    _state_write(script_path, tmp_git_repo, "currentScope", "step-1")
+    _state_write(script_path, tmp_git_repo, "currentRound", 2)
+    # round 1: codex responded in 9s; round 2: codex responded with 0s (no metadata)
+    run_3p(script_path, tmp_git_repo, "availability-append", RUN,
+           json.dumps({"phase": "build", "step": "1", "round": 1, "reviewer": "codex",
+                       "status": "responded", "durationSeconds": 9}))
+    run_3p(script_path, tmp_git_repo, "availability-append", RUN,
+           json.dumps({"phase": "build", "step": "1", "round": 2, "reviewer": "codex",
+                       "status": "responded", "durationSeconds": 0}))
+    r = run_3p(script_path, tmp_git_repo, "hud", RUN)
+    assert r.returncode == 0, r.stderr
+    assert "Codex 🟢 0s" in r.stdout       # latest=0s, not the stale 9s
+    assert "Codex 🟢 9s" not in r.stdout
+
+
 def test_dashboard_resilient_to_prelegacy_state(script_path, tmp_git_repo):
     run_3p(script_path, tmp_git_repo, "init", "x", "20260603-1430")
     sp = tmp_git_repo / ".3p" / RUN / "state.json"

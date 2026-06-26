@@ -696,7 +696,8 @@ Subcommands:
   snapshot diff <run-id> <key>
   parse-response <file>
   round-write <run-id> <phase> <step|-> <round> <reviewer> <verdicts-json>
-  dashboard <run-id>
+  dashboard <run-id> [--stdout]
+  hud <run-id>
   summary <run-id>
   consolidate-final <run-id>
   list
@@ -1805,7 +1806,7 @@ def _phase_progress(state: dict, step_count) -> str:
     idx = (state.get("currentStep") or {}).get("index")
     plan_m = "✓" if phase in ("build", "final", "done") else ("▶" if phase == "plan" else "·")
     if phase == "build":
-        build_m = f"▶ {idx if idx else '?'}/{step_count}"
+        build_m = f"▶ {idx if idx is not None else '?'}/{step_count}"
     elif phase in ("final", "done"):
         build_m = "✓"
     else:
@@ -1825,9 +1826,94 @@ def _align_badge(alignment: dict) -> str:
     return f"{emoji} {status}{tail}{cpt}"
 
 
-def cmd_dashboard(args: list) -> int:
+def _resolve_scope(state: dict) -> str:
+    """The live review scope id. Falls back to the canonical scope for the phase
+    so plan/final phases and legacy runs predating currentScope never render
+    "Scope None" with empty open-findings/agreement sections."""
+    scope = state.get("currentScope")
+    if scope:
+        return scope
+    phase = state.get("phase", "plan")
+    if phase == "final":
+        return "final"
+    if phase == "build":
+        idx = (state.get("currentStep") or {}).get("index")
+        return f"step-{idx}" if idx is not None else "plan"
+    return "plan"
+
+
+def _phase_label(state: dict, step_count) -> str:
+    """Compact one-token phase descriptor for the HUD line."""
+    phase = state.get("phase", "plan")
+    if phase == "plan":
+        return "Phase A Plan"
+    if phase == "build":
+        idx = (state.get("currentStep") or {}).get("index")
+        idx = idx if idx is not None else "?"
+        return f"Phase B step {idx}/{step_count}"
+    if phase == "final":
+        return "Phase C Final"
+    return "Done"
+
+
+def _last_latency(reviewer: str, availability_log: list) -> str:
+    """Most-recent responded latency for a reviewer (the HUD shows 'now', not avg)."""
+    for a in reversed(availability_log or []):
+        if (a.get("reviewer") == reviewer and a.get("status") == "responded"
+                and isinstance(a.get("durationSeconds"), (int, float))):
+            return f"{round(a['durationSeconds'])}s"
+    return "—"
+
+
+def cmd_hud(args: list) -> int:
+    """Emit the compact one-glance HUD block to stdout, deterministically, so the
+    skill relays tool output each round instead of hand-rebuilding the box."""
     if len(args) != 1:
-        print("Usage: 3p.py dashboard <run-id>", file=sys.stderr)
+        print("Usage: 3p.py hud <run-id>", file=sys.stderr)
+        return 2
+    run_id = args[0]
+    anchor, _ = find_anchor()
+    run_dir = run_dir_path(anchor, run_id)
+    state = read_state(run_dir)
+    cfg = state.get("resolvedConfig", {}) or {}
+    round_cap = cfg.get("roundCap", DEFAULTS["roundCap"])
+    cur_round = state.get("currentRound", 0)
+    scope = _resolve_scope(state)
+    step_count = _plan_step_count(run_dir)
+    log = state.get("availabilityLog", []) or []
+    sb = _scoreboard(state)
+    align = (state.get("alignment") or {}).get("status", "unknown")
+    align_emoji = {"green": "🟢", "yellow": "🟡", "red": "🔴"}.get(align, "❔")
+
+    ledger = state.get("ledger") or {}
+    findings = ledger.get("findings", []) or []
+    open_f = [e for e in findings if e.get("scope") == scope and _finding_is_open(e, log)]
+    if open_f:
+        first = open_f[0]
+        open_tail = (f"open findings: {len(open_f)} · "
+                     f"{first['id']} [{first.get('severity', '')}] open")
+    else:
+        open_tail = "open findings: 0"
+
+    reviewers = " · ".join(
+        f"{REVIEWER_LABEL[r]} {sb[r]['avail'].split()[0]} {_last_latency(r, log)}"
+        for r in ("codex", "antigravity")
+    )
+    lines = [
+        f"┌ /3p {run_id} · {_phase_label(state, step_count)} · "
+        f"Round {cur_round}/{round_cap} · Alignment {align_emoji}",
+        f"│ {reviewers} · {open_tail}",
+        "└",
+    ]
+    print("\n".join(lines))
+    return 0
+
+
+def cmd_dashboard(args: list) -> int:
+    to_stdout = "--stdout" in args
+    args = [a for a in args if a != "--stdout"]
+    if len(args) != 1:
+        print("Usage: 3p.py dashboard <run-id> [--stdout]", file=sys.stderr)
         return 2
     run_id = args[0]
     anchor, _ = find_anchor()
@@ -1836,18 +1922,7 @@ def cmd_dashboard(args: list) -> int:
     cfg = state.get("resolvedConfig", {}) or {}
     round_cap = cfg.get("roundCap", DEFAULTS["roundCap"])
     phase = state.get("phase", "plan")
-    scope = state.get("currentScope")
-    if not scope:
-        # Fall back to the canonical scope for the phase so plan/final phases and
-        # legacy runs predating currentScope never render "Scope None" with empty
-        # open-findings/agreement sections.
-        if phase == "final":
-            scope = "final"
-        elif phase == "build":
-            idx = (state.get("currentStep") or {}).get("index")
-            scope = f"step-{idx}" if idx is not None else "plan"
-        else:
-            scope = "plan"
+    scope = _resolve_scope(state)
     cur_round = state.get("currentRound", 0)
     north = state.get("northStar") or "_(not set)_"
     ledger = state.get("ledger") or {}
@@ -1941,8 +2016,15 @@ def cmd_dashboard(args: list) -> int:
     out.append(f"- Open findings in scope: {len(open_f)}")
     out.append("")
 
-    (run_dir / "dashboard.md").write_text("\n".join(out))
-    print(str(run_dir / "dashboard.md"))
+    dest = run_dir / "dashboard.md"
+    dest.write_text("\n".join(out))
+    # Default prints the path (back-compat). --stdout additionally echoes the full
+    # rendered markdown so the skill can relay the scoreboard+ledger straight into
+    # chat at phase boundaries instead of reconstructing the tables by hand.
+    if to_stdout:
+        print("\n".join(out))
+    else:
+        print(str(dest))
     return 0
 
 
@@ -2174,6 +2256,7 @@ def main(argv: list) -> int:
         "parse-response": cmd_parse_response,
         "round-write": cmd_round_write,
         "dashboard": cmd_dashboard,
+        "hud": cmd_hud,
         "summary": cmd_summary,
         "consolidate-final": cmd_consolidate_final,
         "list": cmd_list,

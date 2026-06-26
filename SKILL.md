@@ -95,17 +95,19 @@ Keep the user continuously informed — they should never be left waiting withou
 - Exit conditions: `Phase A complete: unanimous approval at round N` or `Phase A: round cap reached, see summary`
 - Reviewer availability: `⚠ <reviewer> timeout — continuing with <other> only this round`
 - Both-down pauses: surface the full menu and wait for user input
-- **Dashboard refresh:** after every round (once both round files are written), run `3PSH dashboard <run-id>` and surface the path once per phase: `dashboard: .3p/<run-id>/dashboard.md (keep open to follow progress)`. The dashboard is the persistent at-a-glance view (phase progress, per-model scoreboard, open findings, agreement/conflict, alignment); the chat lines are the live narration.
+- **Dashboard — two surfaces, both mandatory:**
+  - *Per round:* `3PSH dashboard <run-id>` regenerates `.3p/<run-id>/dashboard.md` (the persistent at-a-glance file). Surface its path once per phase: `dashboard: .3p/<run-id>/dashboard.md (keep open to follow progress)`.
+  - *Per phase boundary:* `3PSH dashboard <run-id> --stdout` prints the full rendered markdown (scoreboard + open findings + agreement/conflict + ledger + alignment) — **relay that output verbatim into chat** at the end of Phase A, each Phase B step, and Phase C. This is how the user sees the scoreboard and findings ledger in the conversation, not just in the file. Do NOT retype the tables by hand; relay the command output.
 
-**Compact HUD block.** Bracket every round with a one-glance status block so the chat has rhythm instead of a flat trickle — print it at the **start** and **end** of each round, with the per-finding lines in between:
+**Compact HUD block.** Bracket every round with a one-glance status box so the chat has rhythm instead of a flat trickle — **generate it with `3PSH hud <run-id>` and relay the output verbatim** at the **start** and **end** of each round, with the per-finding lines in between. The command derives everything from `state.json` + the ledger, so it is always consistent; never hand-build the box. It looks like:
 
 ```
 ┌ /3p <run-id> · Phase B step 2/5 · Round 3/10 · Alignment 🟢
-│ codex 🟢 14s · antigravity 🟢 22s · open findings: 1 · F-07 [Critical] open
+│ Codex 🟢 14s · Antigravity 🟢 22s · open findings: 1 · F-07 [Important] open
 └
 ```
 
-Derive the fields from `state.json` (phase/step/round/cap/alignment) and the latest round/ledger data. Keep it to ≤3 lines. Do NOT dump full reviewer outputs to chat; they go to round files. Do NOT dump diffs to chat. The per-finding lines above are short summaries (severity + title + your verdict + a one-line reason), NOT the reviewer's raw text.
+Do NOT dump full reviewer outputs to chat; they go to round files. Do NOT dump diffs to chat. The per-finding lines are short summaries (severity + title + your verdict + a one-line reason), NOT the reviewer's raw text.
 
 > **Per-phase alignment self-check (drift signal).** At the start of Phase A, the start of EACH Phase B step, and the start of Phase C, judge whether the current artifact still serves the north-star and record it: `3PSH state-write <run-id> alignment '{"status":"green|yellow|red","note":"<what changed / any scope added or dropped>","checkedAtPhase":"<plan|build-step-N|final>"}'`. `green` = on-track; `yellow` = minor drift/scope ambiguity worth flagging; `red` = materially off-goal (surface to the user before continuing). The value drives the dashboard `Alignment:` indicator and the summary's Goal-alignment section.
 
@@ -115,7 +117,7 @@ Derive the fields from `state.json` (phase/step/round/cap/alignment) and the lat
 2. **Write the plan** to `.3p/<run-id>/plan.md`. The plan MUST contain numbered Steps (Step 1, Step 2, …) — even a one-step task has Step 1. Each step has: goal, expected files touched, acceptance criteria, optional `testCommand`.
 3. **Alignment self-check** (see box above): now that the plan exists, judge whether *it* serves the north-star and write `state.alignment` with `checkedAtPhase: "plan"`. (Run the check on the produced artifact, not before it exists.)
 4. **Run review loop** with `plan-review.md` template and broader severity bar. See Review Loop § below.
-5. On approved exit OR cap-reached exit, set `phase=build` and proceed to Phase B.
+5. On approved exit OR cap-reached exit: **render the full dashboard to chat** — run `3PSH dashboard <run-id> --stdout` and relay its output verbatim (scoreboard + open findings + agreement/conflict + ledger + alignment), and give the `dashboard.md` path. Then set `phase=build` and proceed to Phase B.
 
 ## Phase B: Build (per step)
 
@@ -137,6 +139,7 @@ For each step N declared in the plan:
    - Compute sub-summary (counts of findings/verdicts, files touched, notable items)
    - Write `.3p/<run-id>/step-N-summary.md` with the sub-summary
    - Display the sub-summary in chat
+   - **Render the full dashboard to chat** — run `3PSH dashboard <run-id> --stdout` and relay its output verbatim so the scoreboard + ledger are visible at the step boundary
    - **Continue automatically** to step N+1 (no pause)
 
 ## Phase C: Final review
@@ -149,7 +152,7 @@ For each step N declared in the plan:
 6. **After loop exit, consolidate Phase C into `final-review.md`**: call `3PSH consolidate-final <run-id>`.
 7. Generate the run-wide summary: `3PSH summary <run-id>`
 8. Set phase: `3PSH state-write <run-id> phase '"done"'`
-9. Display the summary path and **stop**. Do not commit, do not deploy. Wait for the user's response.
+9. **Render the final dashboard to chat** — run `3PSH dashboard <run-id> --stdout` and relay its output verbatim (final scoreboard + complete ledger + alignment). Then display the summary path and **stop**. Do not commit, do not deploy. Wait for the user's response.
 
 ## Review loop (shared by all three phases)
 
@@ -163,7 +166,7 @@ Also write `state.currentScope` to one of: `"plan"`, `"step-N"`, `"final"`. On `
 
 For each round:
 
-1. Increment `state.currentRound`. Round files for this scope are named per the scope: `plan-round-N-<reviewer>.md`, `step-M-round-N-<reviewer>.md`, or `final-round-N-<reviewer>.md`. At scope start, do `3PSH state-write <run-id> currentRound 0` AND `3PSH state-write <run-id> currentScope '"<scope-id>"'`, then begin round 1.
+1. Increment `state.currentRound`. Round files for this scope are named per the scope: `plan-round-N-<reviewer>.md`, `step-M-round-N-<reviewer>.md`, or `final-round-N-<reviewer>.md`. At scope start, do `3PSH state-write <run-id> currentRound 0` AND `3PSH state-write <run-id> currentScope '"<scope-id>"'`, then begin round 1. **Open the round in chat:** run `3PSH hud <run-id>` and relay its output verbatim (the compact status box — do NOT hand-build it), then announce `Round N: requesting reviews from codex + antigravity (parallel)…`.
 2. Build each reviewer's prompt by filling the relevant template. Fill `{{north_star}}` from `state.northStar` (`3PSH state-read <run-id> northStar`). **If it is empty/`None`/`null`** — a run resumed from before the north-star was captured, or a pre-upgrade run — **backfill it first:** distill `task.txt` into one sentence and `3PSH state-write <run-id> northStar '"<one-line goal>"'`, then use that value. Never pass an empty goal into a reviewer prompt (it makes drift detection meaningless).
    - For round 1: leave `{{rebuttal_section}}` empty
    - For round ≥ 2: include any rejected/ignored findings from prior rounds that the reviewer raised (each reviewer only sees its own), formatted as: "Last round you raised these findings that were not addressed: <list with verdicts and reasons>. If you still believe any are blocker/critical/important, push back with stronger evidence (point to specific code, cite a concrete failure mode). Otherwise drop them and review the latest artifact."
@@ -219,7 +222,12 @@ For each round:
     - **Approved exit:** **This round was fully attended** (both reviewers responded with structured output) **and both reviewers emitted the explicit `APPROVED` token** for the **current** artifact (the version revised after this round's accepted findings, if any). Exit phase. *Exception:* if user-authorized downgrade mode is active for the run, the working reviewer's APPROVED is sufficient.
     - **Continue:** Otherwise — if any `accepted` findings were applied this round (reviewers must see the revised artifact) OR any reviewer raised findings this round OR this round was not fully attended → proceed to the next round.
     - **Cap reached:** Round 10 finishes without an approved exit. Any remaining `accepted` findings are applied in one final no-review revision pass before exit. Cap-reached exit is recorded explicitly in the round file and surfaced in the final summary.
-11. **Refresh the dashboard:** after both round files are written, run `3PSH dashboard <run-id>` (regenerates `.3p/<run-id>/dashboard.md`). Then display the round's transparency lines and the compact HUD block in chat (see Transparency §). Surface the `dashboard.md` path at least once per phase so the user can keep it open.
+11. **Close the round in chat (MANDATORY — do not start the next round, and do not exit the phase, until all four are done).** After both round files are written, in this order:
+    1. **Refresh the dashboard file:** `3PSH dashboard <run-id>` (regenerates `.3p/<run-id>/dashboard.md`).
+    2. **Per-finding lines:** print one `<Reviewer> [<Severity>] <title> → <verdict>[: <reason>]` line per finding raised this round, or `<Reviewer> ✓ APPROVED` for a clean reviewer (format in Transparency §).
+    3. **Round recap + what you did:** print `Round N: codex <a>/<r>/<i> · antigravity <…>` and a one-line `applied N fixes (files…); rejected X, ignored Y`.
+    4. **Close-of-round HUD:** run `3PSH hud <run-id>` and relay its output verbatim.
+    These chat lines are the user's only live window into the run — skipping or summarizing them away is a defect, not a shortcut. (The full scoreboard + ledger tables are surfaced at each phase boundary, see Phases A/B/C.)
 
 ## Persistent-reviewer downgrade (handle when triggered)
 
