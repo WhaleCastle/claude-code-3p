@@ -696,6 +696,8 @@ Subcommands:
   snapshot diff <run-id> <key>
   parse-response <file>
   round-write <run-id> <phase> <step|-> <round> <reviewer> <verdicts-json>
+  round-close <run-id>
+  phase-end <run-id>
   dashboard <run-id> [--stdout]
   hud <run-id>
   summary <run-id>
@@ -1865,16 +1867,10 @@ def _last_latency(reviewer: str, availability_log: list) -> str:
     return "—"
 
 
-def cmd_hud(args: list) -> int:
-    """Emit the compact one-glance HUD block to stdout, deterministically, so the
-    skill relays tool output each round instead of hand-rebuilding the box."""
-    if len(args) != 1:
-        print("Usage: 3p.py hud <run-id>", file=sys.stderr)
-        return 2
-    run_id = args[0]
-    anchor, _ = find_anchor()
-    run_dir = run_dir_path(anchor, run_id)
-    state = read_state(run_dir)
+def _hud_lines(run_dir: Path, state: dict) -> list:
+    """The compact one-glance HUD box as a list of lines. Shared by `hud` and
+    `round-close` so the round-open and round-close boxes render identically."""
+    run_id = run_dir.name
     cfg = state.get("resolvedConfig", {}) or {}
     round_cap = cfg.get("roundCap", DEFAULTS["roundCap"])
     cur_round = state.get("currentRound", 0)
@@ -1905,23 +1901,150 @@ def cmd_hud(args: list) -> int:
         f"│ {reviewers} · {open_tail}",
         "└",
     ]
-    print("\n".join(lines))
-    return 0
+    return lines
 
 
-def cmd_dashboard(args: list) -> int:
-    to_stdout = "--stdout" in args
-    args = [a for a in args if a != "--stdout"]
+def cmd_hud(args: list) -> int:
+    """Emit the compact one-glance HUD block to stdout, deterministically, so the
+    skill relays tool output each round instead of hand-rebuilding the box."""
     if len(args) != 1:
-        print("Usage: 3p.py dashboard <run-id> [--stdout]", file=sys.stderr)
+        print("Usage: 3p.py hud <run-id>", file=sys.stderr)
         return 2
     run_id = args[0]
     anchor, _ = find_anchor()
     run_dir = run_dir_path(anchor, run_id)
     state = read_state(run_dir)
+    print("\n".join(_hud_lines(run_dir, state)))
+    return 0
+
+
+def _as_round_int(v) -> int:
+    """Coerce a round value (ledger history stores int; availabilityLog may carry
+    a string) to int for comparison. Unparseable -> -1, which never matches a real
+    round (rounds are >= 1)."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _round_review_lines(state: dict, scope: str, rnd: int) -> list:
+    """Per-finding chat lines for one (scope, round): one line per finding each
+    reviewer raised that round, plus a ✓ APPROVED / ⚠ unavailable summary line per
+    reviewer. Reconstructed from the ledger + availabilityLog so the relayed block
+    matches the round files — the skill never hand-types these."""
+    findings = (state.get("ledger") or {}).get("findings", []) or []
+    log = state.get("availabilityLog", []) or []
+    raised = {"codex": [], "antigravity": []}
+    for e in findings:
+        if e.get("scope") != scope or e.get("reviewer") not in raised:
+            continue
+        h = next((x for x in e.get("history", []) if _as_round_int(x.get("round")) == rnd), None)
+        if h is not None:
+            raised[e["reviewer"]].append((e, h))
+    avail = {}
+    for a in log:
+        if _availability_scope(a) == scope and _as_round_int(a.get("round")) == rnd:
+            avail[a.get("reviewer")] = a
+    lines = []
+    for rv in ("codex", "antigravity"):
+        label = REVIEWER_LABEL[rv]
+        a = avail.get(rv)
+        if a is not None and a.get("status") == "unavailable":
+            lines.append(f"{label} ⚠ unavailable ({a.get('reason') or 'no response'})")
+            continue
+        items = sorted(raised[rv], key=lambda t: t[0].get("id", ""))
+        if not items:
+            # APPROVED is only truthful when the reviewer actually responded this
+            # round. A missing availabilityLog record (a dropped/lost
+            # availability-append) must NOT render as approval — that would print a
+            # false positive to chat and hide the very adherence failure this
+            # observability layer exists to surface. Render an explicit warning.
+            if a is not None and a.get("status") == "responded":
+                lines.append(f"{label} ✓ APPROVED")
+            else:
+                lines.append(f"{label} ⚠ no availability record (did not respond this round?)")
+            continue
+        for e, h in items:
+            verdict = h.get("verdict") or e.get("status") or ""
+            reason = h.get("verdictReason") or ""
+            tail = f": {reason}" if reason else ""
+            lines.append(f"{label} [{e.get('severity', '')}] {e.get('title', '')} → {verdict}{tail}")
+    return lines
+
+
+def _round_recap_line(state: dict, scope: str, rnd: int) -> str:
+    """`Round N: Codex a/r/i · Antigravity a/r/i (accepted/rejected/ignored)`."""
+    findings = (state.get("ledger") or {}).get("findings", []) or []
+    counts = {r: {"accepted": 0, "rejected": 0, "ignored": 0}
+              for r in ("codex", "antigravity")}
+    for e in findings:
+        if e.get("scope") != scope or e.get("reviewer") not in counts:
+            continue
+        h = next((x for x in e.get("history", []) if _as_round_int(x.get("round")) == rnd), None)
+        if h is None:
+            continue
+        verdict = (h.get("verdict") or e.get("status") or "").lower()
+        if verdict in counts[e["reviewer"]]:
+            counts[e["reviewer"]][verdict] += 1
+
+    def fmt(rv):
+        c = counts[rv]
+        return f"{REVIEWER_LABEL[rv]} {c['accepted']}/{c['rejected']}/{c['ignored']}"
+
+    return f"Round {rnd}: {fmt('codex')} · {fmt('antigravity')} (accepted/rejected/ignored)"
+
+
+def cmd_round_close(args: list) -> int:
+    """One mandatory command the skill runs after both round files are written;
+    its stdout IS the close-of-round chat block. Regenerates dashboard.md and
+    prints the per-finding lines + recap + close-of-round HUD, so the round result
+    reaches chat as a side effect of a command the skill cannot skip — never as a
+    separate ceremony the model can collapse away on a trivial happy path."""
+    if len(args) != 1:
+        print("Usage: 3p.py round-close <run-id>", file=sys.stderr)
+        return 2
+    run_id = args[0]
+    anchor, _ = find_anchor()
+    run_dir = run_dir_path(anchor, run_id)
+    state = read_state(run_dir)
+    _write_dashboard(run_dir, state)          # keep the persistent file fresh
+    scope = _resolve_scope(state)
+    rnd = state.get("currentRound", 0)
+    out = _round_review_lines(state, scope, rnd)
+    out += ["", _round_recap_line(state, scope, rnd), ""]
+    out += _hud_lines(run_dir, state)
+    print("\n".join(out))
+    return 0
+
+
+def cmd_phase_end(args: list) -> int:
+    """Mandatory at every phase boundary AND before any early stop (e.g. a
+    plan-only run that halts after Phase A). Regenerates dashboard.md and prints
+    the full dashboard markdown (scoreboard + open findings + agreement/conflict +
+    ledger + alignment) so the skill relays it verbatim instead of stopping
+    silently. Decoupled from 'proceed to the next phase' on purpose: stopping is
+    not an excuse to skip the render."""
+    if len(args) != 1:
+        print("Usage: 3p.py phase-end <run-id>", file=sys.stderr)
+        return 2
+    run_id = args[0]
+    anchor, _ = find_anchor()
+    run_dir = run_dir_path(anchor, run_id)
+    state = read_state(run_dir)
+    _, text = _write_dashboard(run_dir, state)
+    print(text)
+    return 0
+
+
+def _dashboard_lines(run_dir: Path, state: dict) -> list:
+    """Full dashboard markdown as a list of lines. The single source of truth for
+    the at-a-glance view — `dashboard`, `phase-end`, and `round-close` all render
+    through this so the file, the phase-boundary chat relay, and the per-round
+    relay can never diverge. run_id is taken from the run dir name."""
+    run_id = run_dir.name
     cfg = state.get("resolvedConfig", {}) or {}
     round_cap = cfg.get("roundCap", DEFAULTS["roundCap"])
-    phase = state.get("phase", "plan")
     scope = _resolve_scope(state)
     cur_round = state.get("currentRound", 0)
     north = state.get("northStar") or "_(not set)_"
@@ -2015,14 +2138,34 @@ def cmd_dashboard(args: list) -> int:
         )
     out.append(f"- Open findings in scope: {len(open_f)}")
     out.append("")
+    return out
 
+
+def _write_dashboard(run_dir: Path, state: dict) -> tuple:
+    """Regenerate dashboard.md and return (dest_path, rendered_text)."""
+    out = _dashboard_lines(run_dir, state)
+    text = "\n".join(out)
     dest = run_dir / "dashboard.md"
-    dest.write_text("\n".join(out))
+    dest.write_text(text)
+    return dest, text
+
+
+def cmd_dashboard(args: list) -> int:
+    to_stdout = "--stdout" in args
+    args = [a for a in args if a != "--stdout"]
+    if len(args) != 1:
+        print("Usage: 3p.py dashboard <run-id> [--stdout]", file=sys.stderr)
+        return 2
+    run_id = args[0]
+    anchor, _ = find_anchor()
+    run_dir = run_dir_path(anchor, run_id)
+    state = read_state(run_dir)
+    dest, text = _write_dashboard(run_dir, state)
     # Default prints the path (back-compat). --stdout additionally echoes the full
     # rendered markdown so the skill can relay the scoreboard+ledger straight into
     # chat at phase boundaries instead of reconstructing the tables by hand.
     if to_stdout:
-        print("\n".join(out))
+        print(text)
     else:
         print(str(dest))
     return 0
@@ -2255,6 +2398,8 @@ def main(argv: list) -> int:
         "snapshot": cmd_snapshot,
         "parse-response": cmd_parse_response,
         "round-write": cmd_round_write,
+        "round-close": cmd_round_close,
+        "phase-end": cmd_phase_end,
         "dashboard": cmd_dashboard,
         "hud": cmd_hud,
         "summary": cmd_summary,
