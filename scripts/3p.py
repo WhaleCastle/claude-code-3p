@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess as _sp
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -30,6 +31,40 @@ def validate_run_id(run_id: str) -> None:
             f"Invalid run_id: {run_id!r}. Expected format: <slug>-<YYYYMMDD>-<HHMM> "
             f"where slug uses only [a-z0-9-]."
         )
+
+
+# --- Timing helpers --------------------------------------------------------
+# Wall-clock is recorded as ISO-8601 UTC strings on a per-run `timeline` event
+# log (see cmd_init / cmd_state_write / cmd_mark). All readers use .get with
+# defaults so runs predating the timeline keys never crash.
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _parse_iso(s):
+    """Parse an ISO-8601 timestamp (tolerating a trailing 'Z'); None on failure."""
+    if not s or not isinstance(s, str):
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _fmt_dur(seconds) -> str:
+    """Human-readable duration, e.g. '1h 02m 03s', '3m 05s', '12s'. '—' if unknown."""
+    if seconds is None:
+        return "—"
+    seconds = int(round(seconds))
+    if seconds < 0:
+        seconds = 0
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
 
 
 HARDCODED_SECRET_PATTERNS = [
@@ -361,6 +396,7 @@ def cmd_init(args: list) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "baselines").mkdir(exist_ok=True)
     resolved_cfg = load_config(anchor, config_path, cli_excludes)
+    now = _now_iso()
     state = {
         "taskSlug": slug,
         "taskDir": str(run_dir),
@@ -388,6 +424,19 @@ def cmd_init(args: list) -> int:
         "northStar": None,
         "alignment": {"status": "unknown", "note": "", "checkedAtPhase": None},
         "ledger": {"nextId": 1, "findings": [], "rebuttals": []},
+        # Timing layer (additive). startedAt anchors the run wall-clock; timeline
+        # is an append-only event log ({ts, kind, label}). Phase transitions are
+        # stamped automatically by state-write; test brackets and any other
+        # granular events go through `mark`. cmd_summary rolls these into the
+        # end-of-run Timing section.
+        "startedAt": now,
+        # Seed the plan-phase event here: init sets phase="plan", so Phase A's
+        # `state-write phase "plan"` is a no-op that would never stamp the timeline
+        # — without this seed, plan-phase wall-clock would collapse into build.
+        "timeline": [
+            {"ts": now, "kind": "run-start", "label": None},
+            {"ts": now, "kind": "phase", "label": "plan"},
+        ],
     }
     write_state(run_dir, state)
     if is_git:
@@ -423,7 +472,39 @@ def cmd_state_write(args: list) -> int:
     value = json.loads(value_json)
     anchor, _ = find_anchor()
     run_dir = run_dir_path(anchor, run_id)
-    mutate_state(run_dir, lambda s: s.update({key: value}))
+
+    def _mutator(s):
+        # Auto-stamp phase transitions onto the timeline so the summary can derive
+        # per-phase wall-clock without the skill having to record it explicitly.
+        # Only stamp on an actual change so resume (which re-writes the same phase)
+        # doesn't inject spurious zero-length segments.
+        if key == "phase" and s.get("phase") != value:
+            s.setdefault("timeline", []).append(
+                {"ts": _now_iso(), "kind": "phase", "label": value}
+            )
+        s[key] = value
+
+    mutate_state(run_dir, _mutator)
+    return 0
+
+
+def cmd_mark(args: list) -> int:
+    """Append a timestamped event to the run timeline: mark <run-id> <kind> [label].
+    Used to bracket granular work (e.g. test-start/test-end) that isn't a phase
+    transition, so cmd_summary can report time spent in it."""
+    if len(args) < 2 or len(args) > 3:
+        print("Usage: 3p.py mark <run-id> <kind> [label]", file=sys.stderr)
+        return 2
+    run_id, kind = args[0], args[1]
+    label = args[2] if len(args) == 3 else None
+    anchor, _ = find_anchor()
+    run_dir = run_dir_path(anchor, run_id)
+    mutate_state(
+        run_dir,
+        lambda s: s.setdefault("timeline", []).append(
+            {"ts": _now_iso(), "kind": kind, "label": label}
+        ),
+    )
     return 0
 
 
@@ -691,6 +772,7 @@ Subcommands:
   update
   state-read <run-id> <key>
   state-write <run-id> <key> <value-json>
+  mark <run-id> <kind> [label]
   availability-append <run-id> <entry-json>
   snapshot capture <run-id> <key>
   snapshot diff <run-id> <key>
@@ -1795,6 +1877,145 @@ def render_ledger_table(state: dict) -> list:
     return lines
 
 
+def _compute_timing(state: dict) -> dict:
+    """Roll the run timeline + availability log into wall-clock durations.
+
+    Returns: {
+      total,               # run wall-clock (startedAt → last event), seconds or None
+      phases,              # {phase_label: seconds} for plan/build/final/... (done excluded)
+      reviewWall,          # reviewer wall-clock, parallel-adjusted (max per round), seconds
+      reviewRaw,           # aggregate reviewer-seconds across both reviewers, seconds
+      testTotal,           # sum of test-start→test-end brackets, seconds
+      perTest,             # [(label, seconds)] per bracketed test
+    }
+    All fields degrade gracefully to None/0/{} for runs predating the timeline.
+    """
+    tl = state.get("timeline") or []
+    parsed = []
+    for e in tl:
+        t = _parse_iso(e.get("ts"))
+        if t is not None:
+            parsed.append((t, e.get("kind"), e.get("label")))
+    parsed.sort(key=lambda x: x[0])
+
+    started = _parse_iso(state.get("startedAt"))
+    end_t = parsed[-1][0] if parsed else None
+    if started is None and parsed:
+        started = parsed[0][0]
+    # If the run has NOT reached the terminal "done" phase (an early-stop, a
+    # summary computed mid-run, or a summary generated before the done stamp is
+    # written), extend the end to now so elapsed wall-clock — and the current
+    # phase's duration — aren't truncated at the last recorded event. A finished
+    # run (phase == "done") uses its recorded events verbatim, so re-reading a
+    # completed run later stays stable/deterministic.
+    if state.get("phase") != "done":
+        now_t = _parse_iso(_now_iso())
+        if now_t is not None:
+            end_t = max(end_t, now_t) if end_t is not None else now_t
+    total = (end_t - started).total_seconds() if (started and end_t) else None
+
+    # Per-phase wall-clock from consecutive phase segments. A phase runs until the
+    # next distinct phase transition (or the final event for the last one).
+    phase_events = [(t, label) for (t, kind, label) in parsed if kind == "phase"]
+    segments = []  # [(label, start_t)]
+    for t, label in phase_events:
+        if segments and segments[-1][0] == label:
+            continue  # collapse repeats (e.g. resume re-writing the same phase)
+        segments.append([label, t])
+    # Anchor the first phase at the run start so phase time isn't lost to setup gap.
+    if segments and started and started < segments[0][1]:
+        segments[0][1] = started
+    phases = {}
+    for i, (label, t) in enumerate(segments):
+        nxt = segments[i + 1][1] if i + 1 < len(segments) else end_t
+        if nxt is None:
+            continue
+        dur = max(0.0, (nxt - t).total_seconds())
+        phases[label] = phases.get(label, 0.0) + dur
+    phases.pop("done", None)  # terminal marker, not a phase with meaningful duration
+
+    # Review time from the availability log. Reviewers run in parallel within a
+    # round, so wall-clock per round ≈ max of the two; reviewRaw sums both.
+    log = state.get("availabilityLog", []) or []
+    review_raw = 0.0
+    round_max = {}
+    for e in log:
+        d = e.get("durationSeconds") or 0
+        if not isinstance(d, (int, float)):
+            d = 0
+        review_raw += d
+        # Coerce to str so an int vs. string discrepancy in a round/step field
+        # (e.g. round logged as 1 for one reviewer and "1" for the other) can't
+        # split one logical round into two keys and defeat the parallel max().
+        key = (str(e.get("phase")), str(e.get("step")), str(e.get("round")))
+        round_max[key] = max(round_max.get(key, 0), d)
+    review_wall = sum(round_max.values())
+
+    # Test brackets: pair test-start with the next test-end sharing its label.
+    open_starts = {}
+    test_total = 0.0
+    per_test = []
+    for t, kind, label in parsed:
+        if kind == "test-start":
+            open_starts[label] = t
+        elif kind == "test-end":
+            st = open_starts.pop(label, None)
+            if st is not None:
+                d = max(0.0, (t - st).total_seconds())
+                test_total += d
+                per_test.append((label, d))
+
+    return {
+        "total": total,
+        "phases": phases,
+        "reviewWall": review_wall,
+        "reviewRaw": review_raw,
+        "testTotal": test_total,
+        "perTest": per_test,
+    }
+
+
+_PHASE_TIMING_LABELS = {
+    "plan": "Phase A · Plan",
+    "build": "Phase B · Build",
+    "final": "Phase C · Final",
+}
+
+
+def render_timing_table(state: dict) -> list:
+    """Markdown lines for the summary's Timing section."""
+    tm = _compute_timing(state)
+    lines = [
+        "| Part | Wall-clock |",
+        "|---|---|",
+        f"| **Total (run wall-clock)** | {_fmt_dur(tm['total'])} |",
+    ]
+    phases = tm["phases"]
+    for label in ("plan", "build", "final"):
+        if label in phases:
+            lines.append(f"| {_PHASE_TIMING_LABELS[label]} | {_fmt_dur(phases[label])} |")
+    for label, dur in phases.items():
+        if label not in _PHASE_TIMING_LABELS:
+            lines.append(f"| Phase · {label} | {_fmt_dur(dur)} |")
+    lines.append(
+        f"| Review (reviewer wall-clock, parallel-adjusted) | {_fmt_dur(tm['reviewWall'])} |"
+    )
+    if tm["reviewRaw"] and round(tm["reviewRaw"]) != round(tm["reviewWall"]):
+        lines.append(
+            f"| Review (aggregate reviewer-seconds, both reviewers) | {_fmt_dur(tm['reviewRaw'])} |"
+        )
+    if tm["testTotal"] or tm["perTest"]:
+        lines.append(f"| Test (build test commands) | {_fmt_dur(tm['testTotal'])} |")
+        for label, dur in tm["perTest"]:
+            lines.append(f"| &nbsp;&nbsp;↳ {label or 'test'} | {_fmt_dur(dur)} |")
+    if tm["total"] is None:
+        lines.append("")
+        lines.append(
+            "_Timing was not recorded for this run (it predates the timing layer)._"
+        )
+    return lines
+
+
 def _plan_step_count(run_dir: Path):
     p = run_dir / "plan.md"
     if not p.exists():
@@ -2195,6 +2416,12 @@ def cmd_summary(args: list) -> int:
         "",
         f"> {task.strip()}",
         "",
+        "## Timing",
+        "",
+    ]
+    out += render_timing_table(state)
+    out += [
+        "",
         "## Final approved plan",
         "",
         plan.strip(),
@@ -2394,6 +2621,7 @@ def main(argv: list) -> int:
         "init": cmd_init,
         "state-read": cmd_state_read,
         "state-write": cmd_state_write,
+        "mark": cmd_mark,
         "availability-append": cmd_availability_append,
         "snapshot": cmd_snapshot,
         "parse-response": cmd_parse_response,

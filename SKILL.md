@@ -133,7 +133,14 @@ For each step N declared in the plan:
 1. Capture step baseline: check `3PSH state-read <run-id> baselines`. **If `step-N` is already present** (resume after the step's baseline was captured but before implementation finished), SKIP this capture — overwriting it with a partially-implemented working tree would silently drop half the step's changes from the reviewer diff. Otherwise: `3PSH snapshot capture <run-id> step-N`. The same guard semantics apply as for pre-build: never re-capture an existing baseline; only capture if absent.
 2. Record current step: `3PSH state-write <run-id> currentStep '{"index": N, "description": "...", "testCommand": "..."}'`.
 3. **Implement step N.** Edit files per the plan. Use Read/Edit/Write tools as normal.
-4. **Run the step's test command** if declared. Capture stdout/stderr/exit-code into `.3p/<run-id>/step-N-test.txt`. If no command, write the file with the literal content `no tests run for this step` so Phase C can detect this uniformly. The test command runs in the anchor directory.
+4. **Run the step's test command** if declared, capturing stdout/stderr **and** the exit code into `.3p/<run-id>/step-N-test.txt`, **bracketed with timing marks** so the summary can report test time. Run this as one Bash call (the `if/then/else` form is deliberate: it captures the real exit code into the file, and it guarantees the `test-end` mark runs even when the test command fails or `set -e` is active — a failing test is normal here and must not drop the mark or abort the flow):
+   ```bash
+   3PSH mark <run-id> test-start step-N
+   if <testcmd> > .3p/<run-id>/step-N-test.txt 2>&1; then ec=0; else ec=$?; fi
+   echo "exit=$ec" >> .3p/<run-id>/step-N-test.txt
+   3PSH mark <run-id> test-end step-N
+   ```
+   If no command is declared, write the file with the literal content `no tests run for this step` so Phase C can detect this uniformly, and **skip the marks** (a no-test step contributes zero test time). The test command runs in the anchor directory.
 5. **Alignment self-check** (see box above): now that the step is implemented and tested, judge whether *the produced change* still serves the north-star and write `state.alignment` with `checkedAtPhase: "build-step-N"`. (Check the artifact you just made, not the pre-edit state.)
 6. **Run review loop** with `step-review.md` template, tighter severity bar, the step's diff (`3PSH snapshot diff <run-id> step-N`), and the test output (read `step-N-test.txt`).
 7. On exit:
@@ -151,9 +158,9 @@ For each step N declared in the plan:
 4. **Consolidate per-step test output:** read every `step-N-test.txt` file in run order. Concatenate them into one block prefixed with `=== step-N ===` headers and the per-step exit code. If a step has the literal `no tests run for this step` body, mark that step as "no tests" in the header. If NO step declared any test command across the whole run, the consolidated block is the single literal line `no tests run during build`. Save this to `.3p/<run-id>/final-test-output.txt` and pass it to the reviewer template as `{{test_output}}`.
 5. **Run review loop** with `final-review.md` template (broader bar). Round count begins fresh.
 6. **After loop exit, consolidate Phase C into `final-review.md`**: call `3PSH consolidate-final <run-id>`.
-7. Generate the run-wide summary: `3PSH summary <run-id>`
-8. Set phase: `3PSH state-write <run-id> phase '"done"'`
-9. **Render the final dashboard to chat** — run `3PSH phase-end <run-id>` and relay its output verbatim (final scoreboard + complete ledger + alignment). Then display the summary path and **stop**. Do not commit, do not deploy. Wait for the user's response.
+7. Set phase: `3PSH state-write <run-id> phase '"done"'`. Do this **before** generating the summary so the terminal timeline event is stamped first — otherwise the summary's Timing section would end the run at Phase C's *start* and report Final as `0s`. (The summary command also extends an unfinished run's clock to "now" as a safety net, but stamping `done` first is the correct, deterministic ordering.)
+8. Generate the run-wide summary: `3PSH summary <run-id>`
+9. **Render the final dashboard to chat** — run `3PSH phase-end <run-id>` and relay its output verbatim (final scoreboard + complete ledger + alignment). Then **surface the Timing section in chat**: `summary.md` now opens with a `## Timing` table (total run wall-clock + per-part breakdown — Plan, Build, Final, Review, Test). Relay that table verbatim as part of the final summary so the user sees total time and time spent in each part without opening the file. Then display the summary path and **stop**. Do not commit, do not deploy. Wait for the user's response.
 
 ## Review loop (shared by all three phases)
 
@@ -292,9 +299,22 @@ On `--resume <slug>`:
 - Final summary: `summary.md`
 - Raw reviewer responses: `<round-prefix>-<reviewer>.raw.txt` (for debugging and `parse-response` input)
 
+## Timing
+
+Every run records wall-clock timing on an append-only `state.timeline` event log — you do **not** hand-track time. It works via side effects of commands you already run:
+
+- `3PSH init` stamps `state.startedAt` and seeds the `run-start` + `plan` events.
+- `3PSH state-write <run-id> phase '"..."'` auto-stamps each phase transition (plan→build→final→done). No extra call needed.
+- Reviewer time comes from the `durationSeconds` you already record in the availability log (parallel-adjusted per round in the roll-up).
+- Test time comes from the `test-start`/`test-end` marks you bracket the step test command with (Phase B step 4).
+- Use `3PSH mark <run-id> <kind> [label]` for any other event you want timed.
+
+`3PSH summary` rolls all of this into the `## Timing` table at the top of `summary.md` (total run wall-clock + per-part: Plan, Build, Final, Review, Test). Relay that table in chat as part of the final summary (Phase C step 9). Runs predating this layer degrade gracefully (timing shows `—`).
+
 ## When you finish
 
 After Phase C summary is written:
 
 1. Display the path: `Summary written to .3p/<run-id>/summary.md`
-2. Stop. Wait for the user. Do not commit, push, deploy, or take any further action.
+2. Surface the `## Timing` table from `summary.md` in chat (total + per-part), so the final summary states total time and time spent in each part.
+3. Stop. Wait for the user. Do not commit, push, deploy, or take any further action.
