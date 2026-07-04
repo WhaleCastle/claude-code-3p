@@ -614,17 +614,30 @@ def cmd_reviewer_role(args: list) -> int:
     return 0
 
 
+# PAL enforces a per-client hard timeout (asyncio.wait_for) from the client
+# JSON's `timeout_seconds`. When it is unset, PAL falls back to its own default
+# (1800s / 30 min) — which is how a wedged reviewer `clink` call hangs for half
+# an hour with no output. We stamp a much tighter backstop into every generated
+# client so a hung reviewer is killed and reported as a timeout instead of
+# looking frozen. Round-1 reviews here were 61s / 153s, so 600s is comfortably
+# above a legitimate slow review while bounding the pathological case.
+REVIEWER_TIMEOUT_BACKSTOP_SECONDS = 600
+
 DEFAULT_CLI_CLIENTS = {
     "codex": {
         "name": "codex",
         "command": "codex",
+        # NOTE: the deprecated `--enable web_search_request` flag is intentionally
+        # NOT here — web search is on by default and that pair injects an `error`
+        # item into codex's `--json` stream that can trip PAL's parser (a suspected
+        # cause of wedged calls). _harden_cli_client also strips it from existing
+        # configs on install.
         "additional_args": [
             "--skip-git-repo-check",
             "--json",
             "--dangerously-bypass-approvals-and-sandbox",
-            "--enable",
-            "web_search_request",
         ],
+        "timeout_seconds": REVIEWER_TIMEOUT_BACKSTOP_SECONDS,
         "env": {},
         "roles": {
             "default": {
@@ -651,6 +664,7 @@ DEFAULT_CLI_CLIENTS = {
         "name": "agy",
         "command": "agy",
         "additional_args": [],
+        "timeout_seconds": REVIEWER_TIMEOUT_BACKSTOP_SECONDS,
         "env": {},
         "roles": {
             "default": {
@@ -692,6 +706,35 @@ def write_cli_client_config(reviewer: str, data: dict) -> None:
     atomic_write_json(path, data)
 
 
+def _strip_flag_pair(args: list, flag: str, value: str) -> list:
+    """Return args with every adjacent [flag, value] pair removed."""
+    out = []
+    i = 0
+    while i < len(args):
+        if args[i] == flag and i + 1 < len(args) and args[i + 1] == value:
+            i += 2
+            continue
+        out.append(args[i])
+        i += 1
+    return out
+
+
+def _harden_cli_client(cli_name: str, client: dict) -> None:
+    """Heal a (possibly stale) reviewer client config in place so it can't hang.
+
+    Idempotent and preserves user customizations. Applied on every install so
+    configs generated before these safeguards existed get upgraded:
+      - stamp a bounded `timeout_seconds` when unset (None/0 → PAL's 1800s default,
+        the 30-min hang) — a user-chosen positive value is respected.
+      - for codex, strip the deprecated `--enable web_search_request` flag pair.
+    """
+    if not isinstance(client.get("timeout_seconds"), (int, float)) or not client.get("timeout_seconds"):
+        client["timeout_seconds"] = REVIEWER_TIMEOUT_BACKSTOP_SECONDS
+    if cli_name == "codex":
+        args = client.get("additional_args") or []
+        client["additional_args"] = _strip_flag_pair(args, "--enable", "web_search_request")
+
+
 def install_pal_config(cfg: dict) -> None:
     for reviewer in sorted(MODEL_REVIEWERS):
         cli_name = REVIEWER_CLI[reviewer]
@@ -715,6 +758,7 @@ def install_pal_config(cfg: dict) -> None:
                 roles[reviewer_role_name(power, review_type)] = role
                 roles[stable_model_role_name(
                     power, reviewer, review_type, model_name)] = role
+        _harden_cli_client(cli_name, client)
         write_cli_client_config(reviewer, client)
 
 
