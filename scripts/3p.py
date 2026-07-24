@@ -623,6 +623,23 @@ def cmd_reviewer_role(args: list) -> int:
 # above a legitimate slow review while bounding the pathological case.
 REVIEWER_TIMEOUT_BACKSTOP_SECONDS = 600
 
+# agy (the Antigravity CLI) has its OWN internal `--print-timeout` flag whose
+# default is 5m0s. 3p used to leave `additional_args` empty, so agy fell back to
+# that 5-minute default and any review slower than ~5 min (large diff or a slow
+# high-reasoning model) self-aborted with stderr `Error: timeout waiting for
+# response` and exit 1 — a reviewer that only *looks* failed when it was just
+# slow. PAL's outer `timeout_seconds` wrapper does NOT stop agy's own print-
+# timeout (which fires first), so the intended 600s bound was effectively 300s.
+# Fix: hand agy a larger print-timeout and put PAL's wrapper ABOVE it, so agy's
+# own clean timeout fires first and PAL's harder kill is only the last resort.
+# The values are a starting recommendation (a hang-vs-throughput trade-off) —
+# tune them here. AGY_TIMEOUT_BACKSTOP_SECONDS must stay above AGY_PRINT_TIMEOUT
+# so codex's tighter 600s bound is never weakened by a shared constant.
+AGY_PRINT_TIMEOUT_FLAG = "--print-timeout"
+AGY_PRINT_TIMEOUT = "1200s"           # agy's internal wait; overrides the 5m0s default
+AGY_TIMEOUT_BACKSTOP_SECONDS = 1500   # PAL outer-wrapper bound for agy; sits ABOVE AGY_PRINT_TIMEOUT
+AGY_WRAPPER_MARGIN_SECONDS = 300      # keep the wrapper at least this far above the print-timeout
+
 DEFAULT_CLI_CLIENTS = {
     "codex": {
         "name": "codex",
@@ -658,13 +675,13 @@ DEFAULT_CLI_CLIENTS = {
         # The Antigravity reviewer talks to PAL as `agy`. PAL's `agy` internal
         # defaults already inject `--dangerously-skip-permissions` for
         # non-interactive auto-approval, so it is deliberately NOT repeated here
-        # (it would be passed twice). additional_args is left empty by default;
-        # users may add `agy` flags (e.g. --add-dir) and install_pal_config
-        # preserves them.
+        # (it would be passed twice). additional_args carries `--print-timeout`
+        # (agy's own default is 5m0s, too low for large diffs) — users may add
+        # more `agy` flags (e.g. --add-dir) and install_pal_config preserves them.
         "name": "agy",
         "command": "agy",
-        "additional_args": [],
-        "timeout_seconds": REVIEWER_TIMEOUT_BACKSTOP_SECONDS,
+        "additional_args": [AGY_PRINT_TIMEOUT_FLAG, AGY_PRINT_TIMEOUT],
+        "timeout_seconds": AGY_TIMEOUT_BACKSTOP_SECONDS,
         "env": {},
         "roles": {
             "default": {
@@ -719,6 +736,86 @@ def _strip_flag_pair(args: list, flag: str, value: str) -> list:
     return out
 
 
+_DURATION_UNIT_SECONDS = {
+    "h": 3600, "m": 60, "s": 1, "ms": 1e-3, "us": 1e-6, "µs": 1e-6, "ns": 1e-9,
+}
+# One number+unit token. Multi-char units first so 'ms'/'us'/'ns' win over the
+# single-char 'm'/'s' in the alternation — otherwise '500ms' would parse as 500
+# *minutes*.
+_DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)(ms|us|µs|ns|h|m|s)")
+# A valid Go duration is one-or-more such tokens back-to-back and nothing else.
+# Used to reject partial/garbage values like '1200sbad', 'foo1200s', or
+# '1h 30m' that findall() alone would happily half-match into a bogus number.
+_DURATION_FULL_RE = re.compile(r"(?:\d+(?:\.\d+)?(?:ms|us|µs|ns|h|m|s))+")
+
+
+def _parse_go_duration_seconds(value):
+    """Parse a Go-style duration string ('1200s', '5m0s', '20m', '1h30m',
+    '500ms') to a number of seconds. The WHOLE string must be a valid duration
+    (Go semantics): a partial/garbage value like '1200sbad' returns None, not a
+    half-parse. Returns None when unparseable so callers can tell it apart from a
+    real 0/0s (which parse to 0.0 — a falsy but valid value)."""
+    if not isinstance(value, str):
+        return None
+    if value == "0":                       # Go accepts a bare "0" (no unit) as zero
+        return 0.0
+    if not _DURATION_FULL_RE.fullmatch(value):
+        return None
+    return sum(float(num) * _DURATION_UNIT_SECONDS[unit]
+               for num, unit in _DURATION_RE.findall(value))
+
+
+def _ensure_agy_print_timeout(args: list) -> float:
+    """Ensure `args` carries at least one well-formed agy `--print-timeout` and
+    return the effective print-timeout in SECONDS that PAL's wrapper must sit
+    above — the LARGEST parseable value across ALL occurrences. Go flag parsing
+    is last-wins, but sizing above the max is safe whichever duplicate agy
+    honors, so a stray second flag can't leave the wrapper below the value agy
+    actually uses. Handles both `--print-timeout X` and `--print-timeout=X`;
+    preserves user values; repairs a dangling or flag-shaped (missing) value
+    with the default; appends the flag when none is present. Mutates `args` in
+    place. Idempotent: well-formed flag+value token(s) are left untouched."""
+    flag = AGY_PRINT_TIMEOUT_FLAG
+    eq_prefix = flag + "="
+    raws = []            # every print-timeout value string found (post-repair)
+    found = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == flag:
+            found = True
+            nxt = args[i + 1] if i + 1 < len(args) else None
+            # Repair with the default when the value is absent (a bare
+            # `--print-timeout`, or a following token that is itself a flag) OR
+            # present but unparseable (e.g. `forever`) — either way agy would
+            # error out on it, so the healed config must not carry it.
+            if isinstance(nxt, str) and not nxt.startswith("-") \
+                    and _parse_go_duration_seconds(nxt) is not None:
+                raws.append(nxt)
+            elif isinstance(nxt, str) and not nxt.startswith("-"):
+                args[i + 1] = AGY_PRINT_TIMEOUT           # present but unparseable → replace
+                raws.append(AGY_PRINT_TIMEOUT)
+            else:
+                args[i + 1:i + 1] = [AGY_PRINT_TIMEOUT]   # missing → insert default
+                raws.append(AGY_PRINT_TIMEOUT)
+            i += 2
+            continue
+        if isinstance(a, str) and a.startswith(eq_prefix):
+            found = True
+            val = a[len(eq_prefix):]
+            if not val or _parse_go_duration_seconds(val) is None:
+                args[i] = eq_prefix + AGY_PRINT_TIMEOUT   # bare/unparseable '=value' → repair
+                val = AGY_PRINT_TIMEOUT
+            raws.append(val)
+        i += 1
+    if not found:
+        args += [flag, AGY_PRINT_TIMEOUT]
+        raws.append(AGY_PRINT_TIMEOUT)
+    parsed = [s for s in (_parse_go_duration_seconds(r) for r in raws) if s is not None]
+    # Nothing parseable (all user values were garbage) → fall back to the default.
+    return max(parsed) if parsed else _parse_go_duration_seconds(AGY_PRINT_TIMEOUT)
+
+
 def _harden_cli_client(cli_name: str, client: dict) -> None:
     """Heal a (possibly stale) reviewer client config in place so it can't hang.
 
@@ -727,12 +824,29 @@ def _harden_cli_client(cli_name: str, client: dict) -> None:
       - stamp a bounded `timeout_seconds` when unset (None/0 → PAL's 1800s default,
         the 30-min hang) — a user-chosen positive value is respected.
       - for codex, strip the deprecated `--enable web_search_request` flag pair.
+      - for agy, inject `--print-timeout` when absent (agy's own 5m0s default
+        self-aborts long reviews) and raise `timeout_seconds` above the print-
+        timeout so PAL's wrapper is the outer bound and agy's clean timeout fires
+        first. A user-chosen `--print-timeout` value is never clobbered.
     """
     if not isinstance(client.get("timeout_seconds"), (int, float)) or not client.get("timeout_seconds"):
         client["timeout_seconds"] = REVIEWER_TIMEOUT_BACKSTOP_SECONDS
     if cli_name == "codex":
         args = client.get("additional_args") or []
         client["additional_args"] = _strip_flag_pair(args, "--enable", "web_search_request")
+    elif cli_name == "agy":
+        args = list(client.get("additional_args") or [])
+        # Effective print-timeout in seconds (largest across all occurrences);
+        # the helper also repairs/appends the flag in place.
+        print_secs = _ensure_agy_print_timeout(args)
+        client["additional_args"] = args
+        # PAL's outer wrapper must outlast agy's own print-timeout so agy self-
+        # aborts cleanly first. Raise on equality (`<=`) so the wrapper sits
+        # STRICTLY above the print-timeout instead of racing it.
+        current = client.get("timeout_seconds")
+        if not isinstance(current, (int, float)) or current <= print_secs:
+            client["timeout_seconds"] = max(
+                AGY_TIMEOUT_BACKSTOP_SECONDS, int(print_secs) + AGY_WRAPPER_MARGIN_SECONDS)
 
 
 def install_pal_config(cfg: dict) -> None:

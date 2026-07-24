@@ -222,9 +222,13 @@ def test_pal_config_install_preserves_existing_client_args(script_path, tmp_path
     assert "Restart Claude Code so PAL MCP reloads reviewer roles" in r.stdout
     agy_pal = json.loads((pal_dir / "agy.json").read_text())
     # User customizations preserved; PAL injects --dangerously-skip-permissions
-    # itself, so it is intentionally absent here.
+    # itself, so it is intentionally absent here. Hardening also injects agy's
+    # --print-timeout (absent from the stale config) and raises the wrapper above
+    # it so PAL's bound outlasts agy's own clean timeout.
     assert agy_pal["name"] == "agy"
-    assert agy_pal["additional_args"] == ["--add-dir", "/tmp/work"]
+    assert agy_pal["additional_args"][:2] == ["--add-dir", "/tmp/work"]
+    assert "--print-timeout" in agy_pal["additional_args"]
+    assert agy_pal["timeout_seconds"] >= 1200
     roles = agy_pal["roles"]
     assert roles["codereviewer-high-reasoning"]["role_args"] == ["--model", "Gemini 3.1 Pro (High)"]
     assert roles["codereviewer-high-code"]["role_args"] == ["--model", "Gemini 3.5 Flash (High)"]
