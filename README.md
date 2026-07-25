@@ -110,6 +110,7 @@ If the reviewer calls fail with "tool not found" or similar, see PAL MCP setup a
 /3p --model-power high       # Use high-power reviewer models for future runs
 /3p --model-power low        # Use faster/lighter reviewer models for future runs
 /3p --models                 # Show the model names mapped to low/high × reasoning/code
+/3p models                   # Interactive picker: discover the latest CLI models and choose per slot
 /3p --models set codex high reasoning gpt-5.5
 /3p --models set antigravity high code "Gemini 3.5 Flash (High)"
 /3p --update                 # Pull and reinstall the skill from its git checkout

@@ -553,12 +553,110 @@ def cmd_model_power(args: list) -> int:
     return 0
 
 
+# --- reviewer model discovery (`models available`) -------------------------
+# Bounded discovery of the models each reviewer CLI currently offers, used by
+# the `/3p models` interactive picker. Fail-soft per reviewer: a missing,
+# hung, failing, or garbled CLI becomes a per-reviewer error entry — never a
+# traceback — so one broken CLI can't hide the other's catalog.
+
+MODELS_CLI_TIMEOUT_ENV = "THREEP_MODELS_CLI_TIMEOUT"
+MODELS_CLI_TIMEOUT_DEFAULT = 30.0
+CLAUDE_MODEL_WARNING = ("Claude-family model — picking it undercuts 3p's "
+                        "cross-vendor reviewer independence")
+
+
+def _models_cli_timeout() -> float:
+    try:
+        value = float(os.environ.get(MODELS_CLI_TIMEOUT_ENV, ""))
+    except ValueError:
+        return MODELS_CLI_TIMEOUT_DEFAULT
+    return value if value > 0 else MODELS_CLI_TIMEOUT_DEFAULT
+
+
+def _run_discovery_cli(argv: list):
+    """Run a reviewer CLI for discovery. Returns (stdout, error): exactly one
+    is None. Never raises for the expected failure modes (missing binary,
+    timeout, non-zero exit)."""
+    timeout = _models_cli_timeout()
+    try:
+        proc = _sp.run(argv, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return None, f"{argv[0]}: command not found (is the CLI installed?)"
+    except _sp.TimeoutExpired:
+        return None, f"{' '.join(argv)}: timed out after {timeout:g}s"
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        suffix = f": {detail[0]}" if detail else ""
+        return None, f"{' '.join(argv)}: exit {proc.returncode}{suffix}"
+    return proc.stdout, None
+
+
+def _discover_codex_models() -> dict:
+    """`codex debug models` renders the raw model catalog as JSON. Keep only
+    entries listed in the picker UI (visibility == "list"); this also drops
+    internal entries like codex-auto-review. The catalog embeds each model's
+    base instructions (~262KB total) so only the distilled fields are kept."""
+    source = "codex debug models"
+    stdout, err = _run_discovery_cli(["codex", "debug", "models"])
+    if err:
+        return {"source": source, "status": "error", "error": err, "models": []}
+    try:
+        models = []
+        for entry in json.loads(stdout)["models"]:
+            if entry.get("visibility") != "list":
+                continue
+            levels = [lvl.get("effort")
+                      for lvl in entry.get("supported_reasoning_levels", [])
+                      if isinstance(lvl, dict) and lvl.get("effort")]
+            models.append({
+                "id": entry["slug"],
+                "displayName": entry.get("display_name"),
+                "reasoningLevels": levels,
+                "warning": None,
+            })
+    except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as exc:
+        return {"source": source, "status": "error",
+                "error": f"{source}: unparseable output ({type(exc).__name__})",
+                "models": []}
+    return {"source": source, "status": "ok", "models": models}
+
+
+def _discover_agy_models() -> dict:
+    """`agy models` prints one model id per line. The id embeds the reasoning
+    tier (e.g. gemini-3.1-pro-high), which maps onto 3p's high/low powers.
+    Claude-family ids are annotated (not excluded): 3p's value comes from
+    cross-vendor review, and a Claude reviewer would review Claude's work."""
+    source = "agy models"
+    stdout, err = _run_discovery_cli(["agy", "models"])
+    if err:
+        return {"source": source, "status": "error", "error": err, "models": []}
+    ids = [line.strip() for line in stdout.splitlines() if line.strip()]
+    if not ids:
+        return {"source": source, "status": "error",
+                "error": f"{source}: no models in output", "models": []}
+    return {"source": source, "status": "ok", "models": [{
+        "id": mid,
+        "displayName": None,
+        "reasoningLevels": [],
+        "warning": CLAUDE_MODEL_WARNING if mid.lower().startswith("claude") else None,
+    } for mid in ids]}
+
+
 def cmd_models(args: list) -> int:
     anchor, _ = find_anchor()
     if not args or args == ["list"]:
         cfg = load_config(anchor)
         print(json.dumps(cfg["models"], indent=2))
         return 0
+    if args == ["available"]:
+        cfg = load_config(anchor)
+        reviewers = {
+            "codex": _discover_codex_models(),
+            "antigravity": _discover_agy_models(),
+        }
+        print(json.dumps({"reviewers": reviewers, "current": cfg["models"]},
+                         indent=2))
+        return 0 if any(r["status"] == "ok" for r in reviewers.values()) else 1
     if len(args) == 5 and args[0] == "set":
         _, reviewer, power, review_type, model_name = args
         if (reviewer not in MODEL_REVIEWERS or power not in MODEL_POWERS
@@ -590,6 +688,7 @@ def cmd_models(args: list) -> int:
         print(PAL_RESTART_MESSAGE)
         return 0
     print("""Usage: 3p.py models [list]
+       3p.py models available
        3p.py models set <codex|antigravity> <low|high> <reasoning|code> <model>""",
           file=sys.stderr)
     return 2
@@ -924,6 +1023,7 @@ Subcommands:
   config-load
   model-power [low|high]
   models [list]
+  models available
   models set <codex|antigravity> <low|high> <reasoning|code> <model>
   reviewer-role <run-id> <codex|antigravity> <reasoning|code>
   pal-config install
