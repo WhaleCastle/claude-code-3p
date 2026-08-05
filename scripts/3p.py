@@ -1639,7 +1639,10 @@ def cmd_snapshot_capture(args: list) -> int:
     snap_dir.mkdir(parents=True, exist_ok=True)
     for rel in files:
         src = anchor / rel
-        if src.is_symlink() or not live_path_allowed(anchor, rel):
+        # Skip symlinks, disallowed paths, and tracked-but-deleted files (a
+        # normal git state: `git status` "D" — the file is enumerated from the
+        # index but absent on disk; copying it would raise FileNotFoundError).
+        if src.is_symlink() or not src.is_file() or not live_path_allowed(anchor, rel):
             continue
         dst = snap_dir / rel
         dst.parent.mkdir(parents=True, exist_ok=True)

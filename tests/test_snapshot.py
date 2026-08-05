@@ -118,6 +118,21 @@ def test_snapshot_uses_resolved_config_not_cli(script_path, tmp_git_repo):
     assert not (snap / "data").exists()
 
 
+def test_snapshot_skips_tracked_but_deleted_file(script_path, tmp_git_repo):
+    """A tracked file deleted from disk (`git status` "D") is enumerated from the
+    index but absent on disk. Capture must skip it, not abort with FileNotFoundError."""
+    setup_repo_with_files(tmp_git_repo, **{"keep.py": "ok\n", "gone.py": "doomed\n"})
+    subprocess.run(["git", "add", "-A"], cwd=tmp_git_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=tmp_git_repo, check=True)
+    (tmp_git_repo / "gone.py").unlink()
+    run_3p(script_path, tmp_git_repo, "init", "x", "20260603-1430")
+    r = run_3p(script_path, tmp_git_repo, "snapshot", "capture", "x-20260603-1430", "pre-build")
+    assert r.returncode == 0, r.stderr
+    snap = tmp_git_repo / ".3p" / "x-20260603-1430" / "baselines" / "pre-build"
+    assert (snap / "keep.py").exists()
+    assert not (snap / "gone.py").exists()
+
+
 def test_snapshot_excludes_root_level_starstar_secrets(script_path, tmp_git_repo):
     """Spec-mandated: **/.aws/credentials must catch root-level .aws/credentials.
     Same for **/credentials.json and **/.aws/config."""
