@@ -25,7 +25,14 @@ CODEX_CATALOG = {
     ]
 }
 
-AGY_LINES = "gemini-x-flash-high\ngemini-x-flash-low\nclaude-sonnet-x\n"
+# Real `agy models` output is tab-delimited: `<id>\t<display name>`.
+AGY_LINES = (
+    "gemini-x-flash-high\tGemini X Flash (High)\n"
+    "gemini-x-flash-low\tGemini X Flash (Low)\n"
+    "claude-sonnet-x\tClaude Sonnet X (Thinking)\n"
+)
+# Some builds print the bare id with no display name.
+AGY_LINES_BARE = "gemini-x-flash-high\ngemini-x-flash-low\n"
 
 
 def write_fake_cli(bin_dir: Path, name: str, body: str) -> None:
@@ -79,6 +86,10 @@ def test_happy_path_filters_and_annotates(script_path, tmp_path):
     assert agy["status"] == "ok"
     ids = [m["id"] for m in agy["models"]]
     assert ids == ["gemini-x-flash-high", "gemini-x-flash-low", "claude-sonnet-x"]
+    # The display name is split off the id, not glued onto it.
+    names = {m["id"]: m["displayName"] for m in agy["models"]}
+    assert names["gemini-x-flash-high"] == "Gemini X Flash (High)"
+    assert names["claude-sonnet-x"] == "Claude Sonnet X (Thinking)"
     warnings = {m["id"]: m["warning"] for m in agy["models"]}
     assert warnings["gemini-x-flash-high"] is None
     assert warnings["gemini-x-flash-low"] is None
@@ -140,3 +151,16 @@ def test_unparseable_codex_output_is_soft(script_path, tmp_path):
     codex = doc["reviewers"]["codex"]
     assert codex["status"] == "error"
     assert "unparseable" in codex["error"]
+
+
+def test_agy_bare_ids_without_display_names(script_path, tmp_path):
+    bin_dir = make_bin(tmp_path)
+    write_fake_cli_printing(bin_dir, "codex", json.dumps(CODEX_CATALOG))
+    write_fake_cli_printing(bin_dir, "agy", AGY_LINES_BARE)
+    result = run_models_available(script_path, tmp_path, bin_dir)
+    assert result.returncode == 0, result.stderr
+    agy = json.loads(result.stdout)["reviewers"]["antigravity"]
+    assert agy["status"] == "ok"
+    assert [m["id"] for m in agy["models"]] == ["gemini-x-flash-high",
+                                                "gemini-x-flash-low"]
+    assert all(m["displayName"] is None for m in agy["models"])

@@ -622,24 +622,36 @@ def _discover_codex_models() -> dict:
 
 
 def _discover_agy_models() -> dict:
-    """`agy models` prints one model id per line. The id embeds the reasoning
-    tier (e.g. gemini-3.1-pro-high), which maps onto 3p's high/low powers.
+    """`agy models` prints one model per line as `<id>\t<display name>` (e.g.
+    `gemini-3.1-pro-high\tGemini 3.1 Pro (High)`). The id embeds the reasoning
+    tier, which maps onto 3p's high/low powers. Split on the first whitespace
+    run so both the tab-delimited form and a bare-id line parse correctly —
+    model ids never contain whitespace, display names usually do. The display
+    name is optional; `agy --model` accepts either spelling.
     Claude-family ids are annotated (not excluded): 3p's value comes from
     cross-vendor review, and a Claude reviewer would review Claude's work."""
     source = "agy models"
     stdout, err = _run_discovery_cli(["agy", "models"])
     if err:
         return {"source": source, "status": "error", "error": err, "models": []}
-    ids = [line.strip() for line in stdout.splitlines() if line.strip()]
-    if not ids:
+    models = []
+    for line in stdout.splitlines():
+        parts = line.split(None, 1)
+        if not parts:
+            continue
+        mid = parts[0]
+        display = parts[1].strip() if len(parts) > 1 else ""
+        models.append({
+            "id": mid,
+            "displayName": display or None,
+            "reasoningLevels": [],
+            "warning": (CLAUDE_MODEL_WARNING
+                        if mid.lower().startswith("claude") else None),
+        })
+    if not models:
         return {"source": source, "status": "error",
                 "error": f"{source}: no models in output", "models": []}
-    return {"source": source, "status": "ok", "models": [{
-        "id": mid,
-        "displayName": None,
-        "reasoningLevels": [],
-        "warning": CLAUDE_MODEL_WARNING if mid.lower().startswith("claude") else None,
-    } for mid in ids]}
+    return {"source": source, "status": "ok", "models": models}
 
 
 def cmd_models(args: list) -> int:
