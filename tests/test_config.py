@@ -245,7 +245,7 @@ def test_user_config_applies_without_project_config(script_path, tmp_path, monke
     user_cfg.write_text(json.dumps({
         "models": {"codex": {"high": {"reasoning": "gpt-machine", "code": "gpt-machine"}}},
     }))
-    monkeypatch.setenv("THREEP_USER_CONFIG", str(user_cfg))
+    monkeypatch.setenv("CLAUDE_CODE_3P_USER_CONFIG", str(user_cfg))
     project = tmp_path / "repo"
     project.mkdir()
     cfg = run_config_load(script_path, project)
@@ -263,7 +263,7 @@ def test_project_config_overrides_user_config_per_slot(script_path, tmp_path, mo
         "timeoutSeconds": 300,
         "models": {"codex": {"high": {"reasoning": "gpt-machine", "code": "gpt-machine"}}},
     }))
-    monkeypatch.setenv("THREEP_USER_CONFIG", str(user_cfg))
+    monkeypatch.setenv("CLAUDE_CODE_3P_USER_CONFIG", str(user_cfg))
     project = tmp_path / "repo"
     (project / ".3p").mkdir(parents=True)
     (project / ".3p" / "config.json").write_text(json.dumps({
@@ -282,7 +282,7 @@ def test_models_set_global_writes_user_config(script_path, tmp_path, monkeypatch
     fake_home.mkdir()
     user_cfg = tmp_path / "user" / "config.json"
     env = {"HOME": str(fake_home), "PATH": "/usr/bin:/bin",
-           "THREEP_USER_CONFIG": str(user_cfg)}
+           "CLAUDE_CODE_3P_USER_CONFIG": str(user_cfg)}
     project = tmp_path / "repo"
     project.mkdir()
     r = run_3p(script_path, project, "models", "set", "--global",
@@ -292,18 +292,18 @@ def test_models_set_global_writes_user_config(script_path, tmp_path, monkeypatch
     assert "machine-wide" in r.stdout
     assert json.loads(user_cfg.read_text())["models"]["codex"]["high"]["reasoning"] == "gpt-global"
     assert not (project / ".3p" / "config.json").exists()
-    monkeypatch.setenv("THREEP_USER_CONFIG", str(user_cfg))
+    monkeypatch.setenv("CLAUDE_CODE_3P_USER_CONFIG", str(user_cfg))
     cfg = run_config_load(script_path, project)
     assert cfg["models"]["codex"]["high"]["reasoning"] == "gpt-global"
 
 
 def test_user_config_pointed_at_project_file_is_not_double_merged(script_path, tmp_path, monkeypatch):
-    """$THREEP_USER_CONFIG aimed at the project file must not break loading."""
+    """The env override aimed at the project file must not break loading."""
     project = tmp_path / "repo"
     (project / ".3p").mkdir(parents=True)
     cfg_file = project / ".3p" / "config.json"
     cfg_file.write_text(json.dumps({"extraExcludes": ["once/"]}))
-    monkeypatch.setenv("THREEP_USER_CONFIG", str(cfg_file))
+    monkeypatch.setenv("CLAUDE_CODE_3P_USER_CONFIG", str(cfg_file))
     cfg = run_config_load(script_path, project)
     assert cfg["excludes"].count("once/") == 1
 
@@ -312,7 +312,7 @@ def test_malformed_user_config_is_ignored(script_path, tmp_path, monkeypatch):
     user_cfg = tmp_path / "user" / "config.json"
     user_cfg.parent.mkdir(parents=True)
     user_cfg.write_text("{ not json")
-    monkeypatch.setenv("THREEP_USER_CONFIG", str(user_cfg))
+    monkeypatch.setenv("CLAUDE_CODE_3P_USER_CONFIG", str(user_cfg))
     project = tmp_path / "repo"
     project.mkdir()
     cfg = run_config_load(script_path, project)

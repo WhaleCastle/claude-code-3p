@@ -289,7 +289,7 @@ def load_config(anchor: Path, config_path=None, cli_excludes=None) -> dict:
             key = file_path.resolve()
         except OSError:
             key = file_path
-        if key in seen:  # $THREEP_USER_CONFIG pointed at the project file
+        if key in seen:  # the env override pointed at the project file
             continue
         seen.add(key)
         _merge_config_file(cfg, file_path)
@@ -303,20 +303,26 @@ def load_config(anchor: Path, config_path=None, cli_excludes=None) -> dict:
     return normalize_config(cfg)
 
 
-USER_CONFIG_ENV = "THREEP_USER_CONFIG"
+USER_CONFIG_ENV = "CLAUDE_CODE_3P_USER_CONFIG"
+USER_CONFIG_DIR = "claude-code-3p"
 
 
 def user_config_path() -> Path:
     """Machine-wide config, applied under every project's .3p/config.json.
 
     Project config is anchored to the git root, so without this layer a setting
-    like the reviewer model map would have to be repeated in every repo. Point
-    $THREEP_USER_CONFIG elsewhere to relocate it (tests rely on this).
+    like the reviewer model map would have to be repeated in every repo.
+
+    The directory is named for this edition, not plain "3p": the Codex edition
+    of this skill has a different reviewer roster and must not share a model
+    map with it. The env override is edition-specific for the same reason — one
+    shared variable would recouple the two. Point
+    $CLAUDE_CODE_3P_USER_CONFIG elsewhere to relocate it (tests rely on this).
     """
     override = os.environ.get(USER_CONFIG_ENV, "").strip()
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".config" / "3p" / "config.json"
+    return Path.home() / ".config" / USER_CONFIG_DIR / "config.json"
 
 
 def read_user_config() -> dict:

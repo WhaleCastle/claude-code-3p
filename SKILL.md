@@ -56,13 +56,15 @@ Advanced users can change those mappings with `/3p --models set [--global] <code
 Configuration resolves in four layers, each overriding the one before:
 
 1. Built-in `DEFAULTS`
-2. **Machine-wide config** — `~/.config/3p/config.json` (relocate with `$THREEP_USER_CONFIG`)
+2. **Machine-wide config** — `~/.config/claude-code-3p/config.json` (relocate with `$CLAUDE_CODE_3P_USER_CONFIG`)
 3. **Project config** — `<anchor>/.3p/config.json`, where the anchor is the git root, else the cwd
 4. CLI flags (`--config`, `--exclude`) at `init` time
 
 The `models` block merges **per slot** (reviewer × power × reviewType), so a project that overrides one slot keeps the machine-wide value for its siblings. Other keys are replaced whole; `excludes` replaces, `extraExcludes` appends, and secret patterns are never overridable.
 
 Because the project layer is anchored to the git root, a setting written without `--global` applies **only** inside that repo. Reviewer models almost always belong in the machine-wide layer.
+
+The machine-wide directory is named for this edition. The Codex edition of this skill keeps its own at `~/.config/codex-3p/config.json`: the two have different reviewer rosters, so a shared file would let a change to one silently alter the other.
 
 ## Interactive model picker (`/3p models`)
 

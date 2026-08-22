@@ -7,13 +7,13 @@ from pathlib import Path
 def isolated_user_config(tmp_path: Path, monkeypatch):
     """Keep the real machine-wide config out of every test.
 
-    load_config layers $THREEP_USER_CONFIG (default ~/.config/3p/config.json)
+    load_config layers $CLAUDE_CODE_3P_USER_CONFIG (default ~/.config/claude-code-3p/config.json)
     under the project config, so without this a developer's own reviewer models
     would leak in and break the DEFAULTS assertions. Subprocesses inherit it;
     the tests that pass an explicit env use a fake HOME, which isolates them
     the same way.
     """
-    monkeypatch.setenv("THREEP_USER_CONFIG", str(tmp_path / "no-user-config.json"))
+    monkeypatch.setenv("CLAUDE_CODE_3P_USER_CONFIG", str(tmp_path / "no-user-config.json"))
 
 
 @pytest.fixture
