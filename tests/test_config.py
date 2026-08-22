@@ -234,3 +234,86 @@ def test_pal_config_install_preserves_existing_client_args(script_path, tmp_path
     assert roles["codereviewer-high-code"]["role_args"] == ["--model", "Gemini 3.5 Flash (High)"]
     assert roles["codereviewer-low-reasoning"]["role_args"] == ["--model", "Gemini 3.1 Pro (Low)"]
     assert roles["codereviewer-low-code"]["role_args"] == ["--model", "Gemini 3.5 Flash (Low)"]
+
+
+# --- machine-wide (global) config layer ------------------------------------
+
+def test_user_config_applies_without_project_config(script_path, tmp_path, monkeypatch):
+    """Models set machine-wide apply in a repo that has no .3p/config.json."""
+    user_cfg = tmp_path / "user" / "config.json"
+    user_cfg.parent.mkdir(parents=True)
+    user_cfg.write_text(json.dumps({
+        "models": {"codex": {"high": {"reasoning": "gpt-machine", "code": "gpt-machine"}}},
+    }))
+    monkeypatch.setenv("THREEP_USER_CONFIG", str(user_cfg))
+    project = tmp_path / "repo"
+    project.mkdir()
+    cfg = run_config_load(script_path, project)
+    assert cfg["models"]["codex"]["high"] == {
+        "reasoning": "gpt-machine", "code": "gpt-machine"}
+    # Slots the machine config does not name still fall back to defaults.
+    assert cfg["models"]["codex"]["low"]["reasoning"] == "gpt-5.4-mini"
+
+
+def test_project_config_overrides_user_config_per_slot(script_path, tmp_path, monkeypatch):
+    """A project overriding one slot keeps the machine value for the others."""
+    user_cfg = tmp_path / "user" / "config.json"
+    user_cfg.parent.mkdir(parents=True)
+    user_cfg.write_text(json.dumps({
+        "timeoutSeconds": 300,
+        "models": {"codex": {"high": {"reasoning": "gpt-machine", "code": "gpt-machine"}}},
+    }))
+    monkeypatch.setenv("THREEP_USER_CONFIG", str(user_cfg))
+    project = tmp_path / "repo"
+    (project / ".3p").mkdir(parents=True)
+    (project / ".3p" / "config.json").write_text(json.dumps({
+        "models": {"codex": {"high": {"code": "gpt-project"}}},
+    }))
+    cfg = run_config_load(script_path, project)
+    assert cfg["models"]["codex"]["high"] == {
+        "reasoning": "gpt-machine",   # untouched by the project layer
+        "code": "gpt-project",        # project wins for the slot it names
+    }
+    assert cfg["timeoutSeconds"] == 300  # non-model keys layer too
+
+
+def test_models_set_global_writes_user_config(script_path, tmp_path, monkeypatch):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    user_cfg = tmp_path / "user" / "config.json"
+    env = {"HOME": str(fake_home), "PATH": "/usr/bin:/bin",
+           "THREEP_USER_CONFIG": str(user_cfg)}
+    project = tmp_path / "repo"
+    project.mkdir()
+    r = run_3p(script_path, project, "models", "set", "--global",
+               "codex", "high", "reasoning", "gpt-global", env=env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines()[0] == "codex.high.reasoning=gpt-global"
+    assert "machine-wide" in r.stdout
+    assert json.loads(user_cfg.read_text())["models"]["codex"]["high"]["reasoning"] == "gpt-global"
+    assert not (project / ".3p" / "config.json").exists()
+    monkeypatch.setenv("THREEP_USER_CONFIG", str(user_cfg))
+    cfg = run_config_load(script_path, project)
+    assert cfg["models"]["codex"]["high"]["reasoning"] == "gpt-global"
+
+
+def test_user_config_pointed_at_project_file_is_not_double_merged(script_path, tmp_path, monkeypatch):
+    """$THREEP_USER_CONFIG aimed at the project file must not break loading."""
+    project = tmp_path / "repo"
+    (project / ".3p").mkdir(parents=True)
+    cfg_file = project / ".3p" / "config.json"
+    cfg_file.write_text(json.dumps({"extraExcludes": ["once/"]}))
+    monkeypatch.setenv("THREEP_USER_CONFIG", str(cfg_file))
+    cfg = run_config_load(script_path, project)
+    assert cfg["excludes"].count("once/") == 1
+
+
+def test_malformed_user_config_is_ignored(script_path, tmp_path, monkeypatch):
+    user_cfg = tmp_path / "user" / "config.json"
+    user_cfg.parent.mkdir(parents=True)
+    user_cfg.write_text("{ not json")
+    monkeypatch.setenv("THREEP_USER_CONFIG", str(user_cfg))
+    project = tmp_path / "repo"
+    project.mkdir()
+    cfg = run_config_load(script_path, project)
+    assert cfg["models"]["codex"]["high"]["reasoning"] == "gpt-5.5"

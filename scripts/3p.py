@@ -204,36 +204,95 @@ def normalize_config(cfg: dict) -> dict:
     return cfg
 
 
+def _merge_models(dst: dict, src) -> None:
+    """Deep-merge a `models` block slot by slot.
+
+    Whole-dict replacement would make a project config that names one slot
+    silently drop the machine-wide value for its siblings (they would fall back
+    to DEFAULTS, not to the layer below). Merging per
+    reviewer/power/reviewType keeps each layer authoritative only for the slots
+    it actually names. Shapes this does not understand are passed through
+    untouched so normalize_config stays the single validator.
+    """
+    if not isinstance(src, dict):
+        return
+    for reviewer, powers in src.items():
+        if not isinstance(powers, dict):
+            dst[reviewer] = powers
+            continue
+        dst_reviewer = dst.get(reviewer)
+        if not isinstance(dst_reviewer, dict):
+            dst_reviewer = dst[reviewer] = {}
+        for power, value in powers.items():
+            if isinstance(value, str):
+                # Legacy flat shape {power: "model"} overrides both reviewTypes.
+                dst_reviewer[power] = {"reasoning": value, "code": value}
+            elif isinstance(value, dict):
+                dst_power = dst_reviewer.get(power)
+                if isinstance(dst_power, str):
+                    dst_power = {"reasoning": dst_power, "code": dst_power}
+                elif not isinstance(dst_power, dict):
+                    dst_power = {}
+                dst_power.update(value)
+                dst_reviewer[power] = dst_power
+            else:
+                dst_reviewer[power] = value
+
+
+def _merge_config_file(cfg: dict, file_path: Path) -> None:
+    """Apply one config layer onto cfg in place. Missing files are a no-op."""
+    if not file_path.exists():
+        return
+    try:
+        file_cfg = json.loads(file_path.read_text())
+    except json.JSONDecodeError as e:
+        print(f"Warning: ignoring malformed {file_path}: {e}", file=sys.stderr)
+        return
+    if not isinstance(file_cfg, dict):
+        print(f"Warning: ignoring {file_path}: expected a JSON object.",
+              file=sys.stderr)
+        return
+    for k, v in file_cfg.items():
+        if k == "excludes":
+            cfg["excludes"] = ensure_string_list(v, "excludes")  # replace defaults
+        elif k == "extraExcludes":
+            for x in ensure_string_list(v, "extraExcludes"):
+                if x not in cfg["excludes"]:
+                    cfg["excludes"].append(x)
+        elif k == "secretPatterns":
+            merged = list(HARDCODED_SECRET_PATTERNS)
+            for x in ensure_string_list(v, "secretPatterns"):
+                if x not in merged:
+                    merged.append(x)
+            cfg["secretPatterns"] = merged
+        elif k == "models":
+            _merge_models(cfg.setdefault("models", {}), v)
+        else:
+            cfg[k] = v
+
+
 def load_config(anchor: Path, config_path=None, cli_excludes=None) -> dict:
-    """Merge defaults <- config file <- CLI flags.
-    - `excludes` in config file REPLACES defaults (user-overridable bloat list).
-    - `extraExcludes` in config file APPENDS to defaults.
+    """Merge defaults <- machine config <- project config file <- CLI flags.
+    - The machine-wide config (see user_config_path) applies in every repo, so
+      reviewer models can be set once per machine instead of per anchor.
+    - `excludes` in a config file REPLACES defaults (user-overridable bloat list).
+    - `extraExcludes` in a config file APPENDS to defaults.
     - CLI `--exclude` flags always APPEND on top.
     - Secret patterns are NEVER overridable.
     """
     cfg = json.loads(json.dumps(DEFAULTS))  # deep copy
-    file_path = config_path or (anchor / ".3p" / "config.json")
-    if file_path.exists():
+    project_path = config_path or (anchor / ".3p" / "config.json")
+    layers = [user_config_path(), project_path]
+    seen = set()
+    for file_path in layers:
         try:
-            file_cfg = json.loads(file_path.read_text())
-        except json.JSONDecodeError as e:
-            print(f"Warning: ignoring malformed {file_path}: {e}", file=sys.stderr)
-            file_cfg = {}
-        for k, v in file_cfg.items():
-            if k == "excludes":
-                cfg["excludes"] = ensure_string_list(v, "excludes")  # replace defaults
-            elif k == "extraExcludes":
-                for x in ensure_string_list(v, "extraExcludes"):
-                    if x not in cfg["excludes"]:
-                        cfg["excludes"].append(x)
-            elif k == "secretPatterns":
-                merged = list(HARDCODED_SECRET_PATTERNS)
-                for x in ensure_string_list(v, "secretPatterns"):
-                    if x not in merged:
-                        merged.append(x)
-                cfg["secretPatterns"] = merged
-            else:
-                cfg[k] = v
+            key = file_path.resolve()
+        except OSError:
+            key = file_path
+        if key in seen:  # $THREEP_USER_CONFIG pointed at the project file
+            continue
+        seen.add(key)
+        _merge_config_file(cfg, file_path)
     if cli_excludes:
         for x in cli_excludes:
             if x not in cfg["excludes"]:
@@ -242,6 +301,38 @@ def load_config(anchor: Path, config_path=None, cli_excludes=None) -> dict:
         if p not in cfg["secretPatterns"]:
             cfg["secretPatterns"].append(p)
     return normalize_config(cfg)
+
+
+USER_CONFIG_ENV = "THREEP_USER_CONFIG"
+
+
+def user_config_path() -> Path:
+    """Machine-wide config, applied under every project's .3p/config.json.
+
+    Project config is anchored to the git root, so without this layer a setting
+    like the reviewer model map would have to be repeated in every repo. Point
+    $THREEP_USER_CONFIG elsewhere to relocate it (tests rely on this).
+    """
+    override = os.environ.get(USER_CONFIG_ENV, "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".config" / "3p" / "config.json"
+
+
+def read_user_config() -> dict:
+    path = user_config_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"Malformed {path}: {e}") from e
+
+
+def write_user_config(data: dict) -> None:
+    path = user_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, data)
 
 
 def project_config_path(anchor: Path) -> Path:
@@ -669,14 +760,20 @@ def cmd_models(args: list) -> int:
         print(json.dumps({"reviewers": reviewers, "current": cfg["models"]},
                          indent=2))
         return 0 if any(r["status"] == "ok" for r in reviewers.values()) else 1
-    if len(args) == 5 and args[0] == "set":
-        _, reviewer, power, review_type, model_name = args
+    if args and args[0] == "set":
+        set_args = [a for a in args[1:] if a not in ("--global", "-g")]
+        is_global = len(set_args) != len(args) - 1
+        if len(set_args) != 4:
+            print("Usage: 3p.py models set [--global] <codex|antigravity> "
+                  "<low|high> <reasoning|code> <model>", file=sys.stderr)
+            return 2
+        reviewer, power, review_type, model_name = set_args
         if (reviewer not in MODEL_REVIEWERS or power not in MODEL_POWERS
                 or review_type not in REVIEW_TYPES or not model_name.strip()):
-            print("Usage: 3p.py models set <codex|antigravity> <low|high> "
-                  "<reasoning|code> <model>", file=sys.stderr)
+            print("Usage: 3p.py models set [--global] <codex|antigravity> "
+                  "<low|high> <reasoning|code> <model>", file=sys.stderr)
             return 2
-        raw = read_project_config(anchor)
+        raw = read_user_config() if is_global else read_project_config(anchor)
         if not isinstance(raw.get("models", {}), dict):
             raw["models"] = {}
         raw_models = raw.setdefault("models", {})
@@ -694,14 +791,28 @@ def cmd_models(args: list) -> int:
         raw_power = raw_reviewer[power]
         raw_power[review_type] = model_name.strip()
         normalize_config(json.loads(json.dumps({**DEFAULTS, **raw})))
-        write_project_config(anchor, raw)
+        if is_global:
+            write_user_config(raw)
+        else:
+            write_project_config(anchor, raw)
         install_pal_config(load_config(anchor))
+        # First line is the stable machine-readable contract; scope goes after.
         print(f"{reviewer}.{power}.{review_type}={model_name.strip()}")
+        if is_global:
+            print(f"scope: machine-wide ({user_config_path()}) — applies in every repo")
+        else:
+            print(f"scope: project ({project_config_path(anchor)})")
+            if user_config_path().exists():
+                print("note: overrides the machine-wide value under this anchor "
+                      "only; use --global to change it everywhere.")
         print(PAL_RESTART_MESSAGE)
         return 0
     print("""Usage: 3p.py models [list]
        3p.py models available
-       3p.py models set <codex|antigravity> <low|high> <reasoning|code> <model>""",
+       3p.py models set [--global] <codex|antigravity> <low|high> <reasoning|code> <model>
+
+--global writes the machine-wide config (%s) instead of
+this project's .3p/config.json, so the models apply in every repo.""" % user_config_path(),
           file=sys.stderr)
     return 2
 
@@ -1036,7 +1147,7 @@ Subcommands:
   model-power [low|high]
   models [list]
   models available
-  models set <codex|antigravity> <low|high> <reasoning|code> <model>
+  models set [--global] <codex|antigravity> <low|high> <reasoning|code> <model>
   reviewer-role <run-id> <codex|antigravity> <reasoning|code>
   pal-config install
   update
