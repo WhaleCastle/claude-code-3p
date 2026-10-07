@@ -131,6 +131,12 @@ DEFAULTS = {
     "secretPatterns": list(HARDCODED_SECRET_PATTERNS),
 }
 
+# Think mode (`init --mode think`) reviews a free-form memo in one phase. Its
+# default round cap is kept out of DEFAULTS so a full-mode resolvedConfig is
+# unchanged; see think_round_cap for the precedence.
+THINK_DEFAULT_ROUND_CAP = 5
+RUN_MODES = {"full", "think"}
+
 MODEL_POWERS = {"low", "high"}
 MODEL_REVIEWERS = {"codex", "antigravity"}
 REVIEW_TYPES = {"reasoning", "code"}
@@ -161,6 +167,13 @@ def normalize_config(cfg: dict) -> dict:
             f"Invalid modelPower: {power!r}. Expected one of: low, high."
         )
     cfg["modelPower"] = power
+
+    if "thinkRoundCap" in cfg:
+        cap = cfg["thinkRoundCap"]
+        if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
+            raise SystemExit(
+                f"Invalid thinkRoundCap: {cap!r}. Expected a positive integer."
+            )
 
     models = cfg.get("models")
     if not isinstance(models, dict):
@@ -301,6 +314,34 @@ def load_config(anchor: Path, config_path=None, cli_excludes=None) -> dict:
         if p not in cfg["secretPatterns"]:
             cfg["secretPatterns"].append(p)
     return normalize_config(cfg)
+
+
+def _config_layer_keys(anchor: Path, config_path=None) -> set:
+    """Top-level keys that the machine/project/--config layers set explicitly.
+    Compared by presence, not against DEFAULTS, so an explicit value equal to the
+    default still counts as a user choice. Missing or malformed files contribute
+    nothing, matching _merge_config_file."""
+    keys = set()
+    for file_path in (user_config_path(), config_path or (anchor / ".3p" / "config.json")):
+        if not file_path.exists():
+            continue
+        try:
+            data = json.loads(file_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if isinstance(data, dict):
+            keys.update(data)
+    return keys
+
+
+def think_round_cap(cfg: dict, explicit_keys: set) -> int:
+    """Think-mode cap: an explicit thinkRoundCap wins, else an explicit roundCap
+    (an existing user override keeps controlling every run), else the default."""
+    if "thinkRoundCap" in explicit_keys:
+        return cfg["thinkRoundCap"]
+    if "roundCap" in explicit_keys:
+        return cfg["roundCap"]
+    return THINK_DEFAULT_ROUND_CAP
 
 
 USER_CONFIG_ENV = "CLAUDE_CODE_3P_USER_CONFIG"
@@ -473,26 +514,104 @@ def append_availability_log(run_dir: Path, entry: dict) -> None:
     mutate_state(run_dir, _mutator)
 
 
+INIT_USAGE = ("Usage: 3p.py init <slug> <timestamp> [--mode full|think] "
+              "[--context <path>]... [--config <p>] [--exclude <pat>]...")
+
+
+def _split_mode_flags(args: list):
+    """Pull --mode/--context out of init's args, leaving the rest for
+    parse_config_flags (shared with other subcommands). Returns
+    (mode, context_paths, rest, status)."""
+    mode, contexts, rest = "full", [], []
+    i = 0
+    while i < len(args):
+        if args[i] in ("--mode", "--context"):
+            if i + 1 >= len(args):
+                print(INIT_USAGE, file=sys.stderr)
+                return None, None, None, 2
+            if args[i] == "--mode":
+                mode = args[i + 1]
+            else:
+                contexts.append(args[i + 1])
+            i += 2
+        else:
+            rest.append(args[i])
+            i += 1
+    if mode not in RUN_MODES:
+        print(f"Unknown mode: {mode!r}. Expected one of: full, think.\n{INIT_USAGE}",
+              file=sys.stderr)
+        return None, None, None, 2
+    if contexts and mode != "think":
+        print("--context requires --mode think", file=sys.stderr)
+        return None, None, None, 2
+    return mode, contexts, rest, 0
+
+
+def _resolve_context_files(anchor: Path, paths: list, secret_patterns: list):
+    """Validate think-mode context files before any run state is written.
+    Returns (absolute_path_strings, error_message_or_None)."""
+    resolved = []
+    for raw in paths:
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        given = Path(os.path.normpath(p))  # as supplied, symlinks NOT followed
+        try:
+            p = p.resolve()
+        except OSError:
+            return None, f"--context {raw!r}: cannot resolve path"
+        if not p.exists():
+            return None, f"--context {raw!r}: no such file"
+        if not p.is_file():
+            return None, f"--context {raw!r}: not a regular file"
+        # Match every trailing slice of the path, not just the anchor-relative
+        # path or basename: a file outside the anchor (e.g. ~/.aws/credentials)
+        # must still hit directory-qualified patterns like **/.aws/credentials.
+        # Check both the path as given and its resolved target, so a symlink
+        # named like a secret (.env -> store/opaque) or one pointing at a secret
+        # cannot launder the name either way.
+        suffixes = []
+        for candidate in (given, p):
+            parts = candidate.parts[1:]  # drop the root ("/" or drive)
+            suffixes += ["/".join(parts[i:]) for i in range(len(parts))]
+        if any(should_exclude(sfx, secret_patterns) for sfx in suffixes):
+            return None, (f"--context {raw!r} matches a secret pattern; "
+                          f"it will not be shared with reviewers")
+        if str(p) not in resolved:
+            resolved.append(str(p))
+    return resolved, None
+
+
 def cmd_init(args: list) -> int:
     if len(args) < 2:
-        print("Usage: 3p.py init <slug> <timestamp> [--config <p>] [--exclude <pat>]...",
-              file=sys.stderr)
+        print(INIT_USAGE, file=sys.stderr)
         return 2
     slug, ts = args[0], args[1]
-    config_path, cli_excludes, status = parse_config_flags(
-        args[2:],
-        usage="Usage: 3p.py init <slug> <timestamp> [--config <p>] [--exclude <pat>]...",
-    )
+    mode, context_args, rest, status = _split_mode_flags(args[2:])
+    if status:
+        return status
+    config_path, cli_excludes, status = parse_config_flags(rest, usage=INIT_USAGE)
     if status:
         return status
     run_id = f"{slug}-{ts}"
     anchor, is_git = find_anchor()
-    if is_git:
+    think = mode == "think"
+    if is_git and not think:  # think runs never create refs
         verify_git_ref_format(f"refs/3p/{run_id}/pre-build")
     run_dir = run_dir_path(anchor, run_id)
+    resolved_cfg = load_config(anchor, config_path, cli_excludes)
+    context_files = []
+    if think:
+        context_files, err = _resolve_context_files(
+            anchor, context_args, resolved_cfg["secretPatterns"])
+        if err:
+            print(err, file=sys.stderr)
+            return 2
+        resolved_cfg["roundCap"] = think_round_cap(
+            resolved_cfg, _config_layer_keys(anchor, config_path))
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "baselines").mkdir(exist_ok=True)
-    resolved_cfg = load_config(anchor, config_path, cli_excludes)
+    phase = "think" if think else "plan"
     now = _now_iso()
     state = {
         "taskSlug": slug,
@@ -500,7 +619,9 @@ def cmd_init(args: list) -> int:
         "repoRoot": str(anchor) if is_git else None,
         "cwdAnchor": str(anchor) if not is_git else None,
         "gitMode": is_git,
-        "phase": "plan",
+        "mode": mode,
+        "contextFiles": context_files,
+        "phase": phase,
         "currentStep": None,
         "currentScope": None,
         "currentRound": 0,
@@ -527,12 +648,13 @@ def cmd_init(args: list) -> int:
         # granular events go through `mark`. cmd_summary rolls these into the
         # end-of-run Timing section.
         "startedAt": now,
-        # Seed the plan-phase event here: init sets phase="plan", so Phase A's
-        # `state-write phase "plan"` is a no-op that would never stamp the timeline
-        # — without this seed, plan-phase wall-clock would collapse into build.
+        # Seed the first phase event here: init sets phase="plan" (or "think"), so
+        # the skill's first `state-write phase` is a no-op that would never stamp
+        # the timeline — without this seed, plan-phase wall-clock would collapse
+        # into build.
         "timeline": [
             {"ts": now, "kind": "run-start", "label": None},
-            {"ts": now, "kind": "phase", "label": "plan"},
+            {"ts": now, "kind": "phase", "label": phase},
         ],
     }
     write_state(run_dir, state)
@@ -1148,7 +1270,7 @@ Usage: 3p.py <subcommand> [args...]
 
 Subcommands:
   slug <task-description>
-  init <slug> <timestamp> [--config <p>] [--exclude <pat>]...
+  init <slug> <timestamp> [--mode full|think] [--context <path>]... [--config <p>] [--exclude <pat>]...
   config-load
   model-power [low|high]
   models [list]
@@ -1170,6 +1292,7 @@ Subcommands:
   dashboard <run-id> [--stdout]
   hud <run-id>
   summary <run-id>
+  promote <think-run-id>
   consolidate-final <run-id>
   list
   clean <run-id>
@@ -1759,6 +1882,10 @@ def cmd_snapshot_capture(args: list) -> int:
     anchor, is_git = find_anchor()
     run_dir = run_dir_path(anchor, run_id)
     state = read_state(run_dir)
+    if state.get("mode", "full") == "think":
+        print(f"snapshot capture: {run_id} is a think-mode run; think runs never "
+              f"take snapshots.", file=sys.stderr)
+        return 2
     cfg = state["resolvedConfig"]
     gi_rules = gitignore_rules(anchor)
     files = enumerate_files(
@@ -1823,6 +1950,8 @@ def round_filename(phase: str, step: str, rnd: int, reviewer: str) -> str:
         return f"step-{step}-round-{rnd}-{reviewer}.md"
     if phase == "final":
         return f"final-round-{rnd}-{reviewer}.md"
+    if phase == "think":
+        return f"think-round-{rnd}-{reviewer}.md"
     raise ValueError(f"Unknown phase: {phase}")
 
 
@@ -1878,8 +2007,8 @@ _FINDING_OPTIONAL = ("location", "issue", "rationale", "verdictReason")
 # Rebuttal-exchange fields are hand-assembled too (SKILL.md step 7), so they get
 # the same treatment as findings: one required decision field, the rest default.
 _REBUTTAL_REQUIRED = ("outcome",)
-_REBUTTAL_OPTIONAL = ("originalRound", "originalTitle", "claudeReasonPrior",
-                      "reviewerPushback", "claudeReasonNow")
+_REBUTTAL_OPTIONAL = ("originalRound", "originalTitle", "originalLocation",
+                      "claudeReasonPrior", "reviewerPushback", "claudeReasonNow")
 
 
 class VerdictsError(ValueError):
@@ -1972,12 +2101,13 @@ def normalize_verdicts(v, reviewer: str) -> dict:
 
 def scope_for(phase: str, step: str) -> str:
     """The canonical review-scope id used by the ledger and dashboard.
-    plan -> 'plan'; build step N -> 'step-N'; final -> 'final'. Mirrors the
-    round-file naming so a finding's scope lines up with currentScope."""
+    plan -> 'plan'; build step N -> 'step-N'; final -> 'final'; think ->
+    'think'. Mirrors the round-file naming so a finding's scope lines up with
+    currentScope."""
     if phase == "build":
         return f"step-{step}"
-    if phase == "final":
-        return "final"
+    if phase in ("final", "think"):
+        return phase
     return "plan"
 
 
@@ -2024,6 +2154,10 @@ def _ledger_upsert(state: dict, scope: str, rnd: int, v: dict) -> None:
                 "severity": f.get("severity", ""),
                 "title": f.get("title", ""),
                 "location": f.get("location", ""),
+                # Kept so a think-mode summary can quote the reviewer's own
+                # argument for a finding that was never resolved.
+                "issue": f.get("issue", ""),
+                "rationale": f.get("rationale", ""),
                 "status": f.get("verdict", ""),
                 "firstRound": rnd,
                 "lastRound": rnd,
@@ -2046,6 +2180,8 @@ def _ledger_upsert(state: dict, scope: str, rnd: int, v: dict) -> None:
             entry["severity"] = f.get("severity", entry.get("severity", ""))
             entry["title"] = f.get("title", entry.get("title", ""))
             entry["location"] = f.get("location", entry.get("location", ""))
+            entry["issue"] = f.get("issue", entry.get("issue", ""))
+            entry["rationale"] = f.get("rationale", entry.get("rationale", ""))
     # Replace (not merely augment) this (scope, reviewer, round) contribution: a
     # re-run of round-write for the same round with a finding DROPPED — a
     # correction, or a later approved/empty write — must remove that finding's
@@ -2086,7 +2222,10 @@ def _ledger_upsert(state: dict, scope: str, rnd: int, v: dict) -> None:
                 "scope": scope,
                 "round": rnd,
                 "originalTitle": r.get("originalTitle", ""),
+                "originalLocation": r.get("originalLocation", ""),
                 "outcome": r.get("outcome", ""),
+                "reviewerPushback": r.get("reviewerPushback", ""),
+                "claudeReasonNow": r.get("claudeReasonNow", ""),
             })
 
 
@@ -2131,7 +2270,7 @@ def cmd_round_write(args: list) -> int:
 # ---------------------------------------------------------------------------
 
 def _review_type_for_phase(phase: str) -> str:
-    """Phase B (build) is code review; plan and final are reasoning review."""
+    """Phase B (build) is code review; plan, final and think are reasoning review."""
     return "code" if phase == "build" else "reasoning"
 
 
@@ -2140,8 +2279,8 @@ def _availability_scope(entry: dict) -> str:
     ph = entry.get("phase", "")
     if ph == "build":
         return f"step-{entry.get('step')}"
-    if ph == "final":
-        return "final"
+    if ph in ("final", "think"):
+        return ph
     return "plan"
 
 
@@ -2369,6 +2508,7 @@ _PHASE_TIMING_LABELS = {
     "plan": "Phase A · Plan",
     "build": "Phase B · Build",
     "final": "Phase C · Final",
+    "think": "Think",
 }
 
 
@@ -2381,7 +2521,7 @@ def render_timing_table(state: dict) -> list:
         f"| **Total (run wall-clock)** | {_fmt_dur(tm['total'])} |",
     ]
     phases = tm["phases"]
-    for label in ("plan", "build", "final"):
+    for label in ("plan", "build", "final", "think"):
         if label in phases:
             lines.append(f"| {_PHASE_TIMING_LABELS[label]} | {_fmt_dur(phases[label])} |")
     for label, dur in phases.items():
@@ -2416,6 +2556,8 @@ def _plan_step_count(run_dir: Path):
 
 def _phase_progress(state: dict, step_count) -> str:
     phase = state.get("phase", "plan")
+    if state.get("mode", "full") == "think":
+        return f"[Think {'✓' if phase == 'done' else '▶'}]"
     idx = (state.get("currentStep") or {}).get("index")
     plan_m = "✓" if phase in ("build", "final", "done") else ("▶" if phase == "plan" else "·")
     if phase == "build":
@@ -2452,6 +2594,8 @@ def _resolve_scope(state: dict) -> str:
     if phase == "build":
         idx = (state.get("currentStep") or {}).get("index")
         return f"step-{idx}" if idx is not None else "plan"
+    if state.get("mode", "full") == "think":
+        return "think"
     return "plan"
 
 
@@ -2466,6 +2610,8 @@ def _phase_label(state: dict, step_count) -> str:
         return f"Phase B step {idx}/{step_count}"
     if phase == "final":
         return "Phase C Final"
+    if phase == "think":
+        return "Think"
     return "Done"
 
 
@@ -2791,6 +2937,10 @@ def cmd_summary(args: list) -> int:
     run_dir = run_dir_path(anchor, run_id)
     state = read_state(run_dir)
     task = (run_dir / "task.txt").read_text() if (run_dir / "task.txt").exists() else "(no task.txt)"
+    if state.get("mode", "full") == "think":
+        (run_dir / "summary.md").write_text(
+            "\n".join(_think_summary_lines(run_dir, state, task)))
+        return 0
     plan = (run_dir / "plan.md").read_text() if (run_dir / "plan.md").exists() else "(no plan.md)"
 
     rounds = sorted(run_dir.glob("plan-round-*.md")) \
@@ -2870,6 +3020,176 @@ def cmd_summary(args: list) -> int:
         out.append(f"- `{p}`")
     out += ["", f"Audit trail location: `{run_dir}`", ""]
     (run_dir / "summary.md").write_text("\n".join(out))
+    return 0
+
+
+def _norm_title(title: str) -> str:
+    return re.sub(r"\s+", " ", (title or "").replace("*", "").replace("`", "")).strip().lower()
+
+
+def _unresolved_disagreements(state: dict) -> list:
+    """Think-scope findings Claude rejected or ignored that the reviewer never
+    dropped: latest verdict rejected/ignored AND still open (the reviewer has not
+    responded in a later round without re-raising it). Returns
+    [(entry, reviewer_argument, claude_position)] — each side's latest word: the
+    reviewer's most recent pushback (else its original issue + rationale), and
+    Claude's most recent rebuttal reason (else its latest verdict reason)."""
+    ledger = state.get("ledger") or {}
+    log = state.get("availabilityLog", []) or []
+    rebuttals = ledger.get("rebuttals", []) or []
+    think_findings = [e for e in ledger.get("findings", []) or [] if e.get("scope") == "think"]
+
+    def _matches(r, e):
+        """A rebuttal belongs to a finding when reviewer + title agree and either
+        its originalLocation agrees too, or (no location given) the title is
+        unique among that reviewer's think findings. An ambiguous match is
+        dropped so one disagreement never shows another's arguments."""
+        if (r.get("scope") != "think" or r.get("reviewer") != e.get("reviewer")
+                or _norm_title(r.get("originalTitle")) != _norm_title(e.get("title"))):
+            return False
+        if r.get("originalLocation"):
+            return (_normalize_finding_key(r["originalLocation"], r.get("originalTitle"))
+                    == _normalize_finding_key(e.get("location"), e.get("title")))
+        same_title = [x for x in think_findings if x.get("reviewer") == e.get("reviewer")
+                      and _norm_title(x.get("title")) == _norm_title(e.get("title"))]
+        return len(same_title) == 1
+
+    out = []
+    for e in think_findings:
+        if (e.get("status") or "").lower() not in ("rejected", "ignored"):
+            continue
+        if not _finding_is_open(e, log):
+            continue
+        matching = [r for r in rebuttals if _matches(r, e)]
+        latest = max(matching, key=lambda r: _as_round_int(r.get("round"))) if matching else None
+        reviewer_arg = (latest or {}).get("reviewerPushback") or " ".join(
+            x for x in (e.get("issue", ""), e.get("rationale", "")) if x) or "_(not recorded)_"
+        hist = e.get("history") or [{}]
+        last_hist = max(hist, key=lambda h: _as_round_int(h.get("round")))
+        claude_arg = ((latest or {}).get("claudeReasonNow")
+                      or last_hist.get("verdictReason") or "_(not recorded)_")
+        out.append((e, reviewer_arg, claude_arg))
+    return out
+
+
+def _think_outcome_line(state: dict) -> str:
+    reason = state.get("exitReason")
+    rnd = state.get("currentRound", 0)
+    if reason == "approved":
+        return f"Unanimous approval at round {rnd}: no substantive objections remain."
+    if reason == "cap-reached":
+        return (f"Round cap reached at round {rnd}: Claude and the reviewers did not fully "
+                f"converge. This is a normal think-mode outcome — see Unresolved "
+                f"disagreements.")
+    return "Not recorded."
+
+
+def _think_summary_lines(run_dir: Path, state: dict, task: str) -> list:
+    """summary.md for a think-mode run: the memo and what is still contested,
+    instead of the full-mode plan/step/uncommitted-files sections."""
+    run_id = run_dir.name
+    memo_f = run_dir / "memo.md"
+    memo = memo_f.read_text().strip() if memo_f.exists() else "(no memo.md)"
+    out = [
+        f"# /3p Think Summary — {run_id}",
+        "",
+        "## Question",
+        "",
+        f"> {task.strip()}",
+        "",
+        "## Timing",
+        "",
+    ]
+    out += render_timing_table(state)
+    out += ["", "## Outcome", "", _think_outcome_line(state), "",
+            "## Final memo", "", memo, "",
+            "## Unresolved disagreements", ""]
+    disagreements = _unresolved_disagreements(state)
+    if not disagreements:
+        out.append("_None — every objection was resolved._")
+    for e, reviewer_arg, claude_arg in disagreements:
+        out += [
+            f"### {e['id']} · {REVIEWER_LABEL.get(e.get('reviewer'), e.get('reviewer'))} · "
+            f"[{e.get('severity', '')}] {e.get('title', '')}",
+            "",
+            f"- **Location:** {e.get('location', '') or '—'}",
+            f"- **Reviewer's argument:** {reviewer_arg}",
+            f"- **Claude's position ({e.get('status', '')}):** {claude_arg}",
+            "",
+        ]
+    out += ["", "## Goal-alignment", "", f"- {_align_badge(state.get('alignment'))}", ""]
+    out += ["## Reviewer scoreboard", ""]
+    out += render_scoreboard_table(state)
+    out += ["", "## Findings ledger", ""]
+    out += render_ledger_table(state)
+    out += ["", "## Round-by-round audit trail", ""]
+    for r in sorted(run_dir.glob("think-round-*.md")):
+        out += [f"### {r.name}", "", r.read_text().strip(), ""]
+    out += [
+        "## Reviewer availability log (full history)",
+        "",
+        "| Phase | Step | Round | Reviewer | Status | Reason | Duration (s) |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for e in state.get("availabilityLog", []):
+        out.append(
+            f"| {e.get('phase','')} | {e.get('step','-') or '-'} | "
+            f"{e.get('round','')} | {e.get('reviewer','')} | "
+            f"{e.get('status','')} | {e.get('reason','-') or '-'} | "
+            f"{e.get('durationSeconds','')} |"
+        )
+    out += ["",
+            "Current reviewer health counters:",
+            "",
+            f"```json\n{json.dumps(state.get('reviewerHealth', {}), indent=2)}\n```",
+            ""]
+    if state.get("downgradeMode"):
+        out += ["## Downgrade mode", "",
+                f"Active: {json.dumps(state['downgradeMode'], indent=2)}", ""]
+    out += [f"Audit trail location: `{run_dir}`", ""]
+    return out
+
+
+def cmd_promote(args: list) -> int:
+    """Print a full-mode task description seeded from a finished think run: the
+    original question, the final memo, and the source run id. The skill writes
+    this to the new run's task.txt."""
+    if len(args) != 1:
+        print("Usage: 3p.py promote <think-run-id>", file=sys.stderr)
+        return 2
+    run_id = args[0]
+    anchor, _ = find_anchor()
+    run_dir = run_dir_path(anchor, run_id)
+    if not (run_dir / "state.json").exists():
+        print(f"promote: no run {run_id!r}", file=sys.stderr)
+        return 2
+    state = read_state(run_dir)
+    if state.get("mode", "full") != "think":
+        print(f"promote: {run_id} is not a think-mode run", file=sys.stderr)
+        return 2
+    if state.get("phase") != "done":
+        print(f"promote: {run_id} has not finished (phase {state.get('phase')!r})",
+              file=sys.stderr)
+        return 2
+    memo_f = run_dir / "memo.md"
+    if not memo_f.exists():
+        print(f"promote: {run_id} has no memo.md", file=sys.stderr)
+        return 2
+    task_f = run_dir / "task.txt"
+    question = task_f.read_text().strip() if task_f.exists() else "(question not recorded)"
+    print("\n".join([
+        "Implement the recommendation from the reviewed memo below.",
+        "",
+        "## Original question",
+        "",
+        question,
+        "",
+        "## Reviewed memo",
+        "",
+        memo_f.read_text().strip(),
+        "",
+        f"(Promoted from /3p think run {run_id}.)",
+    ]))
     return 0
 
 
@@ -3021,6 +3341,7 @@ def main(argv: list) -> int:
         "dashboard": cmd_dashboard,
         "hud": cmd_hud,
         "summary": cmd_summary,
+        "promote": cmd_promote,
         "consolidate-final": cmd_consolidate_final,
         "list": cmd_list,
         "clean": cmd_clean,

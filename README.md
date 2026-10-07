@@ -103,6 +103,9 @@ If the reviewer calls fail with "tool not found" or similar, see PAL MCP setup a
 
 ```
 /3p <task description>      # Start a new run
+/3p --think "<question>"     # Think mode: reviewers challenge a memo, no code (see below)
+/3p --think "<q>" --context notes.md   # ...and may read these files (repeatable)
+/3p --promote <think-run>    # Start a full run seeded from a finished think run's memo
 /3p --resume <task-slug>     # Resume an interrupted run
 /3p --list                   # List recent runs in this repo
 /3p --clean <task-slug>      # Remove a run's artifacts + git refs
@@ -167,6 +170,16 @@ For each step in the approved plan: Claude implements the step, runs the step's 
 **Phase C — Final review** (reasoning models)
 The cumulative diff across all steps + consolidated test output is sent to Codex + Antigravity for whole-task integration review. After that loop exits, the skill writes a comprehensive `summary.md` and **stops**, waiting for the user to review and approve before any commit or deploy.
 
+### Think mode
+
+`/3p --think "<question>"` is for questions, not builds — "should we do X or Y?", "is this design sound?". Claude writes a memo (question, assumptions, options, recommendation, open risks) and Codex + Antigravity review it with a prompt that tells them to **challenge the reasoning**: weak assumptions, logical gaps, missing options (proposing alternatives is encouraged), wrong framing. Same verify-and-revise loop, but:
+
+- One phase only — no plan, no code, no snapshots, no git. Works in any directory, git or not.
+- Round cap defaults to **5** (set `thinkRoundCap` in config to change it; an explicit `roundCap` also applies if `thinkRoundCap` is unset).
+- `APPROVED` means "no substantive objections remain", not "this is correct". Hitting the cap is a normal outcome: `summary.md` ends with an **Unresolved disagreements** section that keeps each side's strongest argument.
+- `--context <path>` files are shared with reviewers (secret-pattern files are refused).
+- `/3p --promote <think-run>` starts a normal Plan → Build → Final run with the memo as its brief.
+
 Throughout all phases, Claude keeps you informed in chat — each reviewer finding is surfaced with its severity, title, and Claude's verdict (accepted/rejected/ignored) plus a one-line reason, along with what Claude changed in response — so you can follow the back-and-forth without digging into the round files.
 
 ### Hard safety guarantees
@@ -178,7 +191,7 @@ Throughout all phases, Claude keeps you informed in chat — each reviewer findi
 
 ### Audit trail
 
-Every reviewer round writes a per-reviewer file: `plan-round-N-<reviewer>.md`, `step-M-round-N-<reviewer>.md`, `final-round-N-<reviewer>.md`. Each file contains findings, Claude's verdicts with reasons, and any rebuttal exchanges. A final `summary.md` consolidates everything plus a per-round reviewer-availability log.
+Every reviewer round writes a per-reviewer file: `plan-round-N-<reviewer>.md`, `step-M-round-N-<reviewer>.md`, `final-round-N-<reviewer>.md` (think mode: `think-round-N-<reviewer>.md`, next to `memo.md`). Each file contains findings, Claude's verdicts with reasons, and any rebuttal exchanges. A final `summary.md` consolidates everything plus a per-round reviewer-availability log.
 
 ---
 
@@ -245,9 +258,10 @@ claude-code-3p/
 ├── prompts/
 │   ├── plan-review.md        # Phase A reviewer prompt template
 │   ├── step-review.md        # Phase B reviewer prompt template
-│   └── final-review.md       # Phase C reviewer prompt template
+│   ├── final-review.md       # Phase C reviewer prompt template
+│   └── think-review.md       # Think-mode memo reviewer prompt template
 └── tests/
-    └── test_*.py             # 79 pytest tests covering all helpers
+    └── test_*.py             # pytest suite covering all helpers
 ```
 
 Run the test suite locally:
