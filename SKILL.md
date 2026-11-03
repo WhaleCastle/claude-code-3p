@@ -25,6 +25,8 @@ Parse the invocation:
 - `/3p --resume <task-slug>` → resume from `state.json` of the most recent run with that slug (full `<slug>-<timestamp>` disambiguates)
 - `/3p --list` → call `python3 ~/.claude/skills/3p/scripts/3p.py list` and print
 - `/3p --clean <task-slug-or-runid>` → call `python3 ~/.claude/skills/3p/scripts/3p.py clean <run-id>` (resolve slug to run-id if needed)
+- `/3p --prune [--apply] [--compact] [--days N]` → call `3PSH prune ...` with the same flags and relay its output. Bare `--prune` is a **report only** (nothing changes); `--apply` deletes finished runs older than the retention; `--compact` also compacts younger finished runs. See Storage & retention §.
+- `/3p --compact <task-slug-or-runid>` → call `3PSH compact <run-id>` and relay its output (finished runs only)
 - `/3p --model-power` → show the user a numbered menu for `high` or `low`; after they choose, call `3PSH model-power <choice>` and print the saved value
 - `/3p --model-power high|low` → call `3PSH model-power <value>` directly and print the saved value
 - `/3p --models` → call `3PSH models list` and print the reviewer model map
@@ -64,7 +66,7 @@ Configuration resolves in four layers, each overriding the one before:
 3. **Project config** — `<anchor>/.3p/config.json`, where the anchor is the git root, else the cwd
 4. CLI flags (`--config`, `--exclude`) at `init` time
 
-The `models` block merges **per slot** (reviewer × power × reviewType), so a project that overrides one slot keeps the machine-wide value for its siblings. Other keys are replaced whole; `excludes` replaces, `extraExcludes` appends, and secret patterns are never overridable.
+The `models` block merges **per slot** (reviewer × power × reviewType), so a project that overrides one slot keeps the machine-wide value for its siblings. Other keys are replaced whole; `excludes` replaces, `extraExcludes` appends, and secret patterns are never overridable. `retention.days` (default `30`, `0` disables) sets how long finished runs are kept (see Storage & retention §).
 
 Because the project layer is anchored to the git root, a setting written without `--global` applies **only** inside that repo. Reviewer models almost always belong in the machine-wide layer.
 
@@ -86,6 +88,7 @@ When invoked as `/3p models` — config-only: NEVER start a Plan/Build/Final run
 3. Never include files matching the hardcoded secret patterns in any reviewer prompt (the helpers enforce this — but if you manually paste content into a prompt, double-check).
 4. Never claim a phase is "approved" unless the approving round was fully attended AND both reviewers explicitly emitted `APPROVED`.
 5. Never skip the user-facing transparency display (see Transparency §). In particular: every review round ends with a relayed `3PSH round-close`, and you never stop or leave a phase without a relayed `3PSH phase-end` — including early/plan-only stops (see Early-stop §). A zero-finding, approved-at-round-1 phase is NOT an exception; render it like any other.
+6. Never link to `.3p/` from tracked files. `.3p/` is local, git-ignored scratch that is compacted and pruned automatically, so a link from a doc, spec, script or test breaks for everyone else and soon for you. Summarise evidence in the doc itself and point to the PR or ticket; anything reusable (scripts, fixtures, test runners) belongs in the repo. If `summary.md` shows a "Tracked files reference .3p/" section, tell the user.
 
 ## Phase 0: New run setup
 
@@ -187,7 +190,7 @@ For each step N declared in the plan:
 4. **Consolidate per-step test output:** read every `step-N-test.txt` file in run order. Concatenate them into one block prefixed with `=== step-N ===` headers and the per-step exit code. If a step has the literal `no tests run for this step` body, mark that step as "no tests" in the header. If NO step declared any test command across the whole run, the consolidated block is the single literal line `no tests run during build`. Save this to `.3p/<run-id>/final-test-output.txt` and pass it to the reviewer template as `{{test_output}}`.
 5. **Run review loop** with `final-review.md` template (broader bar). Round count begins fresh.
 6. **After loop exit, consolidate Phase C into `final-review.md`**: call `3PSH consolidate-final <run-id>`.
-7. Set phase: `3PSH state-write <run-id> phase '"done"'`. Do this **before** generating the summary so the terminal timeline event is stamped first — otherwise the summary's Timing section would end the run at Phase C's *start* and report Final as `0s`. (The summary command also extends an unfinished run's clock to "now" as a safety net, but stamping `done` first is the correct, deterministic ordering.)
+7. Set phase: `3PSH state-write <run-id> phase '"done"'`. This also **compacts the run** (see Storage & retention §): baseline copies are deleted only because `final-diff.txt` (step 2) already holds the cumulative diff — never set `done` before that file exists. Do this **before** generating the summary so the terminal timeline event is stamped first — otherwise the summary's Timing section would end the run at Phase C's *start* and report Final as `0s`. (The summary command also extends an unfinished run's clock to "now" as a safety net, but stamping `done` first is the correct, deterministic ordering.)
 8. Generate the run-wide summary: `3PSH summary <run-id>`
 9. **Render the final dashboard to chat** — run `3PSH phase-end <run-id>` and relay its output verbatim (final scoreboard + complete ledger + alignment). Then **surface the Timing section in chat**: `summary.md` now opens with a `## Timing` table (total run wall-clock + per-part breakdown — Plan, Build, Final, Review, Test). Relay that table verbatim as part of the final summary so the user sees total time and time spent in each part without opening the file. Then display the summary path and **stop**. Do not commit, do not deploy. Wait for the user's response.
 
@@ -340,6 +343,7 @@ On `--resume <slug>`:
 3. If `phase == "build"`: read `currentStep` and continue from where it left off (re-snapshot the step baseline only if not yet captured; otherwise reuse).
 4. If `phase == "final"`: continue the final review loop.
 4a. If `phase == "think"`: read `memo.md` and continue the think review loop from `currentRound + 1` (see Think mode §). If `phase == "done"` and `mode == "think"`, the run is finished — show its summary instead.
+4b. If `phase == "done"` (full mode), the run is finished and its baselines are compacted: show `summary.md`; do not resume. `snapshot capture`/`snapshot diff` refuse compacted baselines (exit 2) and name the `refs/3p/<run-id>/<key>` ref, which keeps the baseline's tracked files (not untracked ones) until the run is pruned. To redo the work, start a new run.
 5. If `phase == "paused"`: read `pausedReason`, display, ask user how to proceed.
 
 ## Output format reminders
@@ -348,6 +352,16 @@ On `--resume <slug>`:
 - Step summary: `step-M-summary.md`
 - Final summary: `summary.md`
 - Raw reviewer responses: `<round-prefix>-<reviewer>.raw.txt` (for debugging and `parse-response` input)
+
+## Storage & retention
+
+`.3p/` is local scratch and is kept small automatically:
+
+- **Snapshots** record ignored paths compactly: nothing under `.3p/` or `.git/`, and a wholly-ignored directory such as `node_modules/` is one entry.
+- **At `done`** the run compacts itself: baseline copies and their bulky state fields are deleted (only when `final-diff.txt` exists), as are `node_modules/`, `.next/` and `dist/` folders anywhere in the run outside `baselines/`. Plan, round files, summaries, diffs, dashboard and `task.txt` stay. The git refs keep each baseline's tracked files until the run is pruned; untracked files that were in a baseline copy are not recoverable after compaction (`final-diff.txt` still records every change).
+- **At `init`** finished runs older than `retention.days` (default 30) are deleted together with their `refs/3p/<run-id>/*` refs. This never deletes unfinished runs, folders that are not 3p runs, runs containing a `.keep` file, or runs whose folder name appears in a tracked file; it reports what it kept on stderr and never fails `init`.
+- **Manually**: `/3p --prune` reports what would happen; add `--apply` to delete and `--compact` to also compact younger finished runs (useful for runs that finished before compaction existed).
+- To keep a run indefinitely, create an empty `.keep` file in its folder. To disable pruning, set `"retention": {"days": 0}`.
 
 ## Timing
 
@@ -367,4 +381,5 @@ After Phase C summary is written:
 
 1. Display the path: `Summary written to .3p/<run-id>/summary.md`
 2. Surface the `## Timing` table from `summary.md` in chat (total + per-part), so the final summary states total time and time spent in each part.
-3. Stop. Wait for the user. Do not commit, push, deploy, or take any further action.
+3. If `summary.md` has a "Tracked files reference .3p/" section, tell the user which files link into `.3p/` and that those links will break (Hard safety 6).
+4. Stop. Wait for the user. Do not commit, push, deploy, or take any further action.

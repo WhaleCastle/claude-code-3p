@@ -129,6 +129,8 @@ DEFAULTS = {
     },
     "excludes": list(DEFAULT_BLOAT_EXCLUDES),
     "secretPatterns": list(HARDCODED_SECRET_PATTERNS),
+    # Finished runs older than this are pruned when a new run starts; 0 = never.
+    "retention": {"days": 30},
 }
 
 # Think mode (`init --mode think`) reviews a free-form memo in one phase. Its
@@ -167,6 +169,16 @@ def normalize_config(cfg: dict) -> dict:
             f"Invalid modelPower: {power!r}. Expected one of: low, high."
         )
     cfg["modelPower"] = power
+
+    retention = cfg.get("retention", DEFAULTS["retention"])
+    if not isinstance(retention, dict):
+        raise SystemExit('Invalid retention: expected an object like {"days": 30}.')
+    days = retention.get("days", DEFAULTS["retention"]["days"])
+    if isinstance(days, bool) or not isinstance(days, int) or days < 0:
+        raise SystemExit(
+            f"Invalid retention.days: {days!r}. Expected a non-negative integer "
+            f"(0 disables pruning).")
+    cfg["retention"] = {"days": days}
 
     if "thinkRoundCap" in cfg:
         cap = cfg["thinkRoundCap"]
@@ -479,9 +491,54 @@ def write_state(run_dir: Path, state: dict) -> None:
     atomic_write_json(run_dir / "state.json", state)
 
 
-@contextlib.contextmanager
 def state_lock(run_dir: Path):
-    lock_path = run_dir / ".state.lock"
+    return _file_lock(run_dir / ".state.lock")
+
+
+_HELD_LIFECYCLE = {}
+
+
+@contextlib.contextmanager
+def run_lifecycle_lock(run_dir: Path):
+    """Serialize everything that reads, writes or deletes a run's baseline
+    copies: snapshot capture, snapshot diff, the phase transition (which can
+    trigger compaction) and compaction itself. Always taken BEFORE state_lock.
+    Reentrant within one process, so compaction triggered by state-write does
+    not deadlock on the lock state-write already holds."""
+    key = str(run_dir.resolve())
+    if _HELD_LIFECYCLE.get(key):
+        _HELD_LIFECYCLE[key] += 1
+        try:
+            yield
+        finally:
+            _HELD_LIFECYCLE[key] -= 1
+        return
+    with _file_lock(run_dir / ".lifecycle.lock"):
+        _HELD_LIFECYCLE[key] = 1
+        try:
+            yield
+        finally:
+            _HELD_LIFECYCLE.pop(key, None)
+
+
+def _with_lifecycle_lock(fn):
+    """Run a `<run-id> ...` subcommand under the run's lifecycle lock."""
+    def wrapper(args: list) -> int:
+        if not args or not _RUN_ID_RE.match(args[0]):
+            return fn(args)  # let the command report usage / bad run-id
+        anchor, _ = find_anchor()
+        run_dir = run_dir_path(anchor, args[0])
+        if not run_dir.is_dir():
+            return fn(args)
+        with run_lifecycle_lock(run_dir):
+            return fn(args)
+    wrapper.__name__ = fn.__name__
+    wrapper.__doc__ = fn.__doc__
+    return wrapper
+
+
+@contextlib.contextmanager
+def _file_lock(lock_path: Path):
     lock_path.touch(exist_ok=True)
     f = open(lock_path, "r+")
     try:
@@ -664,6 +721,7 @@ def cmd_init(args: list) -> int:
         if ".3p/" not in existing.splitlines():
             sep = "" if existing.endswith("\n") or existing == "" else "\n"
             gi.write_text(existing + sep + ".3p/\n")
+    _auto_prune(anchor, run_id, resolved_cfg)
     print(run_id)
     return 0
 
@@ -691,6 +749,7 @@ def cmd_state_write(args: list) -> int:
     value = json.loads(value_json)
     anchor, _ = find_anchor()
     run_dir = run_dir_path(anchor, run_id)
+    finished = []
 
     def _mutator(s):
         # Auto-stamp phase transitions onto the timeline so the summary can derive
@@ -701,9 +760,21 @@ def cmd_state_write(args: list) -> int:
             s.setdefault("timeline", []).append(
                 {"ts": _now_iso(), "kind": "phase", "label": value}
             )
+            if value == "done":
+                finished.append(True)
         s[key] = value
 
-    mutate_state(run_dir, _mutator)
+    # A phase change waits for any in-flight capture/diff, so a run can never
+    # finish (and compact) underneath one.
+    with (run_lifecycle_lock(run_dir) if key == "phase" else contextlib.nullcontext()):
+        mutate_state(run_dir, _mutator)
+        if finished:
+            # A finished run sheds its bulky reconstructable data. Never let
+            # that turn a successful state-write into a failure.
+            try:
+                print(_compact_report_line(run_id, compact_run(run_dir)), file=sys.stderr)
+            except Exception as e:  # noqa: BLE001
+                print(f"warning: could not compact {run_id}: {e}", file=sys.stderr)
     return 0
 
 
@@ -1296,6 +1367,8 @@ Subcommands:
   consolidate-final <run-id>
   list
   clean <run-id>
+  compact <run-id>
+  prune [--apply] [--compact] [--dry-run] [--days N]
 """
 
 
@@ -1731,6 +1804,7 @@ def cmd_snapshot(args: list) -> int:
     return 2
 
 
+@_with_lifecycle_lock
 def cmd_snapshot_diff(args: list) -> int:
     """Symmetric per-file diff. Snapshot side uses persisted fileManifest
     (stable across mid-task .gitignore changes). Live side uses
@@ -1744,6 +1818,13 @@ def cmd_snapshot_diff(args: list) -> int:
     run_dir = run_dir_path(anchor, run_id)
     state = read_state(run_dir)
     baseline_meta = state["baselines"][key]
+    if baseline_meta.get("compacted"):
+        print(f"snapshot diff: baseline {key!r} of {run_id} was compacted when the "
+              f"run finished; its file copies are gone. Tracked files can be "
+              f"recovered from git ref {baseline_meta.get('gitRef') or '(none recorded)'}; "
+              f"untracked files are not kept.",
+              file=sys.stderr)
+        return 2
     snap_path = Path(baseline_meta["path"])
     cfg = state["resolvedConfig"]
     if "fileManifest" in baseline_meta:
@@ -1766,7 +1847,12 @@ def cmd_snapshot_diff(args: list) -> int:
     ))
     captured_ignored = set(baseline_meta.get("capturedIgnoredPaths", []))
     if captured_ignored:
-        live_files -= captured_ignored
+        # Exact entries (legacy per-file lists and individual files) plus
+        # collapsed `dir/` entries, which cover everything below them.
+        ignored_dirs = {p for p in captured_ignored if p.endswith("/")}
+        live_files = {f for f in live_files
+                      if f not in captured_ignored
+                      and not (ignored_dirs and _under_ignored_dir(f, ignored_dirs))}
     # Apply captured-time non-root ignore sources (nested .gitignore, .git/info/exclude,
     # global excludesFile) so newly-created files matching those frozen rules stay out
     # of the live side. This restores full ignore-stack symmetry that root-only
@@ -1874,6 +1960,7 @@ def _parse_diff_header_paths(rest: str, snap_str: str, anchor_str: str) -> str:
     return ""
 
 
+@_with_lifecycle_lock
 def cmd_snapshot_capture(args: list) -> int:
     if len(args) != 2:
         print("Usage: 3p.py snapshot capture <run-id> <key>", file=sys.stderr)
@@ -1885,6 +1972,10 @@ def cmd_snapshot_capture(args: list) -> int:
     if state.get("mode", "full") == "think":
         print(f"snapshot capture: {run_id} is a think-mode run; think runs never "
               f"take snapshots.", file=sys.stderr)
+        return 2
+    if state.get("phase") == "done" or state.get("baselines", {}).get(key, {}).get("compacted"):
+        print(f"snapshot capture: {run_id} is finished and its baselines are "
+              f"compacted; refusing to capture {key!r}.", file=sys.stderr)
         return 2
     cfg = state["resolvedConfig"]
     gi_rules = gitignore_rules(anchor)
@@ -1904,18 +1995,7 @@ def cmd_snapshot_capture(args: list) -> int:
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
     # Capture-time ignored paths (git mode only; honors full git ignore stack)
-    captured_ignored = []
-    if is_git:
-        try:
-            res = _sp.run(
-                ["git", "ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
-                cwd=anchor, capture_output=True, check=True,
-            )
-            captured_ignored = [
-                p for p in res.stdout.decode("utf-8").split("\x00") if p
-            ]
-        except _sp.CalledProcessError:
-            captured_ignored = []
+    captured_ignored = _capture_ignored_paths(anchor) if is_git else []
     baseline_entry = {
         "path": str(snap_dir),
         "fileManifest": sorted(files),
@@ -1923,23 +2003,114 @@ def cmd_snapshot_capture(args: list) -> int:
         "capturedIgnoredPaths": sorted(captured_ignored),
         "capturedIgnoreSources": collect_gitignore_sources(anchor, is_git),  # NEW
     }
+    ref, prior_sha = None, None
     if is_git:
         ref = f"refs/3p/{run_id}/{key}"
         verify_git_ref_format(ref)
-        try:
-            sha = _sp.run(["git", "stash", "create", "-u"], cwd=anchor,
-                          capture_output=True, text=True, check=True).stdout.strip()
-            if sha:
-                _sp.run(["git", "update-ref", ref, sha], cwd=anchor, check=True)
+        prior_sha = _sp.run(["git", "rev-parse", "--verify", "-q", ref], cwd=anchor,
+                            capture_output=True, text=True).stdout.strip() or None
+        stash = _sp.run(["git", "stash", "create", "-u"], cwd=anchor,
+                        capture_output=True, text=True)
+        sha = stash.stdout.strip() if stash.returncode == 0 else ""
+        if sha:  # no SHA (e.g. no commits yet) means no ref, as before
+            # Record the SHA only once the ref really points at it, so the
+            # advertised recovery ref can never name a different tree.
+            pin = _sp.run(["git", "update-ref", ref, sha], cwd=anchor,
+                          capture_output=True, text=True)
+            if pin.returncode == 0:
                 baseline_entry["gitSha"] = sha
                 baseline_entry["gitRef"] = ref
-        except _sp.CalledProcessError:
-            pass
+            else:
+                print(f"warning: could not pin git ref {ref} for {key!r}: "
+                      f"{pin.stderr.strip()}", file=sys.stderr)
+
+    refused = []
 
     def _mutator(s):
+        # Defensive re-check under the state lock (the lifecycle lock already
+        # keeps the run from finishing mid-capture): never overwrite a
+        # compacted marker.
+        if s.get("phase") == "done" or s.get("baselines", {}).get(key, {}).get("compacted"):
+            refused.append(True)
+            return
         s["baselines"][key] = baseline_entry
     mutate_state(run_dir, _mutator)
+    if refused:
+        # Put the recovery ref back the way state still describes it.
+        if baseline_entry.get("gitSha"):
+            restore = (["git", "update-ref", ref, prior_sha] if prior_sha
+                       else ["git", "update-ref", "-d", ref])
+            _sp.run(restore, cwd=anchor, capture_output=True)
+        print(f"snapshot capture: {run_id} finished during capture; {key!r} was "
+              f"not recorded.", file=sys.stderr)
+        return 2
     return 0
+
+
+def _has_excluded_component(rel: str) -> bool:
+    """True if any component of rel is an ALWAYS_EXCLUDED_DIRS name. The diff's
+    live walk skips those names at every depth, so they are never worth
+    recording."""
+    return any(part in ALWAYS_EXCLUDED_DIRS for part in rel.rstrip("/").split("/"))
+
+
+def _git_ignored_listing(anchor: Path, extra_args=(), pathspecs=()) -> list:
+    cmd = ["git", "ls-files", "--others", "--ignored", "--exclude-standard", "-z",
+           *extra_args]
+    if pathspecs:
+        cmd += ["--", *pathspecs]
+    res = _sp.run(cmd, cwd=anchor, capture_output=True, check=True,
+                  env={**os.environ, "GIT_LITERAL_PATHSPECS": "1"})
+    return [p for p in res.stdout.decode("utf-8").split("\x00") if p]
+
+
+def _capture_ignored_paths(anchor: Path) -> list:
+    """Capture-time ignored paths, kept small: entries under .3p/.git are
+    dropped, and a wholly-ignored directory is recorded once as `dir/`.
+
+    A `--directory` entry is only kept when git confirms the directory itself
+    is ignored, checked WITHOUT the trailing slash: git also reports an
+    untracked dir whose files merely happen to be ignored (`logs/` holding only
+    `*.log`), and `logs/*` + `!logs/keep.txt` matches `logs/` but not `logs`.
+    Collapsing those would hide a later non-ignored file from the diff, so
+    their contents are listed per file instead."""
+    try:
+        entries = [p for p in _git_ignored_listing(anchor, ["--directory"])
+                   if not _has_excluded_component(p)]
+        dirs = [p for p in entries if p.endswith("/")]
+        files = {p for p in entries if not p.endswith("/")}
+        confirmed = set()
+        if dirs:
+            res = _sp.run(
+                ["git", "check-ignore", "-z", "--stdin"], cwd=anchor,
+                input="".join(d.rstrip("/") + "\x00" for d in dirs).encode("utf-8"),
+                capture_output=True,
+            )
+            if res.returncode not in (0, 1):  # 1 = nothing ignored
+                raise _sp.CalledProcessError(res.returncode, "git check-ignore")
+            confirmed = {p for p in res.stdout.decode("utf-8").split("\x00") if p}
+        kept_dirs = {d for d in dirs if d.rstrip("/") in confirmed}
+        unconfirmed = [d for d in dirs if d.rstrip("/") not in confirmed]
+        if unconfirmed:
+            files |= {p for p in _git_ignored_listing(anchor, pathspecs=unconfirmed)
+                      if not _has_excluded_component(p)}
+        return sorted(files | kept_dirs)
+    except (_sp.CalledProcessError, OSError, UnicodeDecodeError):
+        try:
+            return sorted(p for p in _git_ignored_listing(anchor)
+                          if not _has_excluded_component(p))
+        except (_sp.CalledProcessError, OSError, UnicodeDecodeError):
+            return []
+
+
+def _under_ignored_dir(rel: str, ignored_dirs: set) -> bool:
+    """True if some ancestor directory of rel is a captured `dir/` entry."""
+    i = rel.find("/")
+    while i != -1:
+        if rel[:i + 1] in ignored_dirs:
+            return True
+        i = rel.find("/", i + 1)
+    return False
 
 
 def round_filename(phase: str, step: str, rnd: int, reviewer: str) -> str:
@@ -2939,7 +3110,9 @@ def cmd_summary(args: list) -> int:
     task = (run_dir / "task.txt").read_text() if (run_dir / "task.txt").exists() else "(no task.txt)"
     if state.get("mode", "full") == "think":
         (run_dir / "summary.md").write_text(
-            "\n".join(_think_summary_lines(run_dir, state, task)))
+            "\n".join(_think_summary_lines(run_dir, state, task)
+                      + [""] + _tracked_link_warning(
+                          anchor, state["resolvedConfig"]["secretPatterns"])))
         return 0
     plan = (run_dir / "plan.md").read_text() if (run_dir / "plan.md").exists() else "(no plan.md)"
 
@@ -3016,9 +3189,13 @@ def cmd_summary(args: list) -> int:
         "Changed/new files:",
         "",
     ]
-    for p in changed_files:
+    if changed_files is None:
+        out.append("_Unavailable: the pre-build baseline was compacted and "
+                   "final-diff.txt is missing._")
+    for p in changed_files or []:
         out.append(f"- `{p}`")
     out += ["", f"Audit trail location: `{run_dir}`", ""]
+    out += _tracked_link_warning(anchor, state["resolvedConfig"]["secretPatterns"])
     (run_dir / "summary.md").write_text("\n".join(out))
     return 0
 
@@ -3202,6 +3379,8 @@ def _enumerate_diff_paths(anchor: Path, state: dict, run_id: str) -> list:
     final_diff = run_dir / "final-diff.txt"
     if final_diff.exists():
         diff_text = final_diff.read_text()
+    elif state["baselines"]["pre-build"].get("compacted"):
+        return None  # nothing left to diff against; caller says so
     else:
         proc = _sp.run(
             [sys.executable, __file__, "snapshot", "diff", run_id, "pre-build"],
@@ -3230,6 +3409,153 @@ def _enumerate_diff_paths(anchor: Path, state: dict, run_id: str) -> list:
     return sorted(paths)
 
 
+COMPACT_HEAVY_DIRS = {"node_modules", ".next", "dist"}
+# Baseline fields only `snapshot diff` needs; a compacted baseline keeps
+# path/gitSha/gitRef: the ref keeps the baseline's tracked files (`git stash
+# create` does not record untracked ones).
+_BASELINE_BULK_KEYS = ("fileManifest", "capturedIgnoredPaths",
+                       "capturedIgnoreSources", "capturedGitignoreRules")
+
+
+class CompactError(Exception):
+    pass
+
+
+def _fmt_bytes(n: int) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if n < 1024 or unit == "GiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GiB"
+
+
+def _disk_usage(path: Path) -> int:
+    """Allocated bytes under path, never following symlinks."""
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                st = os.lstat(os.path.join(root, f))
+            except OSError:
+                continue
+            blocks = getattr(st, "st_blocks", None)
+            total += blocks * 512 if blocks is not None else st.st_size
+    return total
+
+
+def _remove_tree(path: Path) -> int:
+    size = _disk_usage(path)
+    shutil.rmtree(path)
+    return size
+
+
+def compact_run(run_dir: Path) -> dict:
+    """Shrink a finished run: delete build-output dirs (outside baselines/) and,
+    when final-diff.txt exists, the baseline file copies and their bulky state
+    fields. Baselines are all-or-nothing: without final-diff.txt they stay
+    fully intact. Idempotent. Raises CompactError for unfinished runs."""
+    with run_lifecycle_lock(run_dir):
+        return _compact_run_locked(run_dir)
+
+
+def _compact_run_locked(run_dir: Path) -> dict:
+    state = read_state(run_dir)
+    if state.get("phase") != "done":
+        raise CompactError(
+            f"run is in phase {state.get('phase')!r}; only finished runs "
+            f"(phase \"done\") can be compacted")
+    report = {"freedBytes": 0, "removed": [], "notes": []}
+    run_real = run_dir.resolve()
+
+    # Build output agents left inside the run dir. Never descend into
+    # baselines/ (copies are only removed by the baseline pass below) and
+    # never follow or delete symlinks.
+    for root, dirs, _ in os.walk(run_dir):
+        here = Path(root)
+        keep = []
+        for d in dirs:
+            p = here / d
+            if (here == run_dir and d == "baselines") or p.is_symlink():
+                continue
+            if d in COMPACT_HEAVY_DIRS and run_real in p.resolve().parents:
+                report["freedBytes"] += _remove_tree(p)
+                report["removed"].append(str(p.relative_to(run_dir)) + "/")
+                continue
+            keep.append(d)
+        dirs[:] = keep
+
+    baselines = state.get("baselines", {})
+    pending = [k for k, v in baselines.items()
+               if isinstance(v, dict) and not v.get("compacted")]
+    if pending and not (run_dir / "final-diff.txt").exists():
+        report["notes"].append("kept baselines intact: final-diff.txt is missing")
+        pending = []
+    if pending:
+        # Record the compaction BEFORE deleting anything: if a deletion fails
+        # midway, every affected baseline already reads as compacted (diff and
+        # capture refuse it) instead of a half-deleted copy that diffs as
+        # "everything is new". A later compact finishes the deletions.
+        def _mark(s):
+            for key in pending:
+                entry = s.get("baselines", {}).get(key)
+                if isinstance(entry, dict):
+                    for k in _BASELINE_BULK_KEYS:
+                        entry.pop(k, None)
+                    entry["compacted"] = True
+        mutate_state(run_dir, _mark)
+    compacted_keys = [k for k, v in baselines.items()
+                      if isinstance(v, dict) and (v.get("compacted") or k in pending)]
+    root = run_dir / "baselines"
+    if compacted_keys and root.is_symlink():
+        report["notes"].append("left baselines/ alone: it is a symlink")
+    elif compacted_keys:
+        run_real = run_dir.resolve()
+        for key in compacted_keys:
+            bdir = root / key
+            if bdir.is_symlink() or not bdir.is_dir():
+                continue
+            if run_real not in bdir.resolve().parents:
+                report["notes"].append(f"left baselines/{key}/ alone: outside the run")
+                continue
+            report["freedBytes"] += _remove_tree(bdir)
+            report["removed"].append(f"baselines/{key}/")
+
+    if report["freedBytes"] or not state.get("compactedAt"):
+        def _stamp(s):
+            s.setdefault("compactedAt", _now_iso())
+            s["compactedBytes"] = s.get("compactedBytes", 0) + report["freedBytes"]
+        mutate_state(run_dir, _stamp)
+    return report
+
+
+def _compact_report_line(run_id: str, report: dict) -> str:
+    line = f"compacted {run_id}: freed {_fmt_bytes(report['freedBytes'])}"
+    if report["removed"]:
+        line += f" ({len(report['removed'])} dirs removed)"
+    for note in report["notes"]:
+        line += f"; {note}"
+    return line
+
+
+def cmd_compact(args: list) -> int:
+    if len(args) != 1:
+        print("Usage: 3p.py compact <run-id>", file=sys.stderr)
+        return 2
+    run_id = args[0]
+    anchor, _ = find_anchor()
+    run_dir = run_dir_path(anchor, run_id)
+    if not (run_dir / "state.json").exists():
+        print(f"compact: no run {run_id!r}", file=sys.stderr)
+        return 2
+    try:
+        report = compact_run(run_dir)
+    except CompactError as e:
+        print(f"compact: {e}", file=sys.stderr)
+        return 2
+    print(_compact_report_line(run_id, report))
+    return 0
+
+
 def cmd_list(args: list) -> int:
     anchor, _ = find_anchor()
     base = anchor / ".3p"
@@ -3243,23 +3569,371 @@ def cmd_list(args: list) -> int:
     return 0
 
 
+def _delete_run_refs(anchor: Path, run_id: str) -> list:
+    """Delete refs/3p/<run-id>/*. Returns what could NOT be deleted; a failed
+    listing counts as a failure, never as "no refs"."""
+    listing = _sp.run(
+        ["git", "for-each-ref", f"refs/3p/{run_id}/", "--format=%(refname)"],
+        cwd=anchor, capture_output=True, text=True,
+    )
+    if listing.returncode != 0:
+        return [f"refs/3p/{run_id}/* (listing failed: {listing.stderr.strip()})"]
+    return [ref for ref in listing.stdout.splitlines()
+            if _sp.run(["git", "update-ref", "-d", ref], cwd=anchor,
+                       capture_output=True).returncode != 0]
+
+
+def _purge_run(anchor: Path, run_id: str, is_git: bool, still_eligible=None) -> dict:
+    """Delete a run's refs, then its folder. Under the run's lifecycle lock,
+    `still_eligible()` (if given) is re-checked first and must return
+    (True, "") or (False, reason). Refs go first: if any cannot be deleted the
+    folder is kept, so a later prune can find the run and retry.
+    Returns {"deleted": bool, "freedBytes": int, "reason": str}."""
+    run_dir = run_dir_path(anchor, run_id)
+    out = {"deleted": False, "freedBytes": 0, "reason": ""}
+    if run_dir.is_symlink() or not run_dir.is_dir():
+        failed = _delete_run_refs(anchor, run_id) if is_git else []
+        if failed:
+            out["reason"] = f"could not delete git ref(s) {', '.join(failed)}"
+            return out
+        if run_dir.is_symlink():
+            run_dir.unlink()
+        out["deleted"] = True
+        return out
+    with run_lifecycle_lock(run_dir):
+        if still_eligible is not None:
+            ok, why = still_eligible()
+            if not ok:
+                out["reason"] = why
+                return out
+        failed = _delete_run_refs(anchor, run_id) if is_git else []
+        if failed:
+            out["reason"] = (f"could not delete git ref(s) {', '.join(failed)}; "
+                             f"folder kept so a later prune can retry")
+            return out
+        out["freedBytes"] = _disk_usage(run_dir)
+        # Invalidate the baselines BEFORE deleting anything, so an interrupted
+        # deletion can never leave copies that diff as "everything is new".
+        if (run_dir / "state.json").is_file():
+            def _invalidate(s):
+                for entry in s.get("baselines", {}).values():
+                    if isinstance(entry, dict):
+                        for k in _BASELINE_BULK_KEYS:
+                            entry.pop(k, None)
+                        entry["compacted"] = True
+                s["deletingAt"] = _now_iso()
+            try:
+                mutate_state(run_dir, _invalidate)
+            except (OSError, ValueError, AttributeError) as e:
+                # Automatic pruning stays conservative; an explicit `clean` of a
+                # run with corrupt state still goes ahead, as it always has.
+                if still_eligible is not None:
+                    out["reason"] = f"could not mark the run for deletion: {e}"
+                    return out
+        # state.json goes last: if anything else fails to delete, the folder
+        # still reads as a finished run and a later prune retries it.
+        for child in sorted(run_dir.iterdir(), key=lambda c: c.name == "state.json"):
+            if child.name == ".lifecycle.lock":  # still held; removed below
+                continue
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+    shutil.rmtree(run_dir, ignore_errors=True)
+    out["deleted"] = True
+    return out
+
+
 def cmd_clean(args: list) -> int:
     if len(args) != 1:
         print("Usage: 3p.py clean <run-id>", file=sys.stderr)
         return 2
-    run_id = args[0]
     anchor, is_git = find_anchor()
-    run_dir = run_dir_path(anchor, run_id)
-    if run_dir.exists():
-        shutil.rmtree(run_dir)
-    if is_git:
-        refs = _sp.run(
-            ["git", "for-each-ref", f"refs/3p/{run_id}/", "--format=%(refname)"],
-            cwd=anchor, capture_output=True, text=True,
-        ).stdout.splitlines()
-        for ref in refs:
-            _sp.run(["git", "update-ref", "-d", ref], cwd=anchor)
+    result = _purge_run(anchor, args[0], is_git)
+    if not result["deleted"]:
+        print(f"clean: {result['reason']}", file=sys.stderr)
+        return 1
     return 0
+
+
+_TRACKED_3P_REF_RE = re.compile(r"\.3p/[A-Za-z0-9._-]+")
+
+
+def _tracked_3p_run_refs(anchor: Path) -> dict:
+    """Run-dir names that ANY tracked file mentions as `.3p/<name>` -> files.
+    NUL-separated, uncolored output so user git config cannot change parsing."""
+    res = _sp.run(["git", "-c", "color.grep=false", "-c", "grep.lineNumber=false",
+                   "-c", "grep.column=false", "-c", "grep.fullName=false",
+                   "grep", "-z", "-I", "-o", "--no-color", "-E", _TRACKED_3P_REF_RE.pattern],
+                  cwd=anchor, capture_output=True, text=True)
+    # Exit 1 means "no match", but git still exits 1 after an unreadable file
+    # (e.g. permission denied); any diagnostic means the scan is incomplete,
+    # so refuse rather than treat unseen links as absent.
+    if res.returncode not in (0, 1) or res.stderr.strip():
+        raise RuntimeError(f"could not scan tracked files for .3p links: "
+                           f"{res.stderr.strip() or f'git grep exit {res.returncode}'}")
+    refs = {}
+    for line in res.stdout.splitlines():
+        path, sep, rest = line.partition("\0")
+        found = _TRACKED_3P_REF_RE.search(rest) if sep else None
+        if found:
+            refs.setdefault(found.group(0)[len(".3p/"):], set()).add(path)
+    return refs
+
+
+_TRACKED_LINK_LIMIT = 20
+
+
+def tracked_3p_references(anchor: Path) -> list:
+    """(path, line, text) for every tracked-file line that names `.3p/`,
+    `.gitignore` excepted (it lists `.3p/` on purpose). Empty outside git."""
+    _, is_git = find_anchor()
+    if not is_git:
+        return []
+    res = _sp.run(["git", "-c", "color.grep=false", "-c", "grep.column=false",
+                   "-c", "grep.fullName=false", "grep", "-z", "-n", "-I",
+                   "--no-color", "-F", ".3p/"],
+                  cwd=anchor, capture_output=True, text=True)
+    # Exit 1 also follows an unreadable file; any diagnostic = incomplete scan.
+    if res.returncode not in (0, 1) or res.stderr.strip():
+        raise RuntimeError(res.stderr.strip() or f"git grep exit {res.returncode}")
+    hits = []
+    for record in res.stdout.splitlines():
+        parts = record.split("\0")
+        if len(parts) >= 3:  # path\0line\0text
+            path, line, text = parts[0], parts[1], "\0".join(parts[2:])
+        elif len(parts) == 2 and ":" in parts[1]:  # path\0line:text
+            path, (line, text) = parts[0], parts[1].split(":", 1)
+        else:
+            continue
+        if path != ".gitignore":
+            hits.append((path, line, text.strip()))
+    return hits
+
+
+def _tracked_link_warning(anchor: Path, secret_patterns: list) -> list:
+    """Summary lines warning about tracked files that link into .3p/. Lines
+    from secret-pattern files are named but never quoted."""
+    try:
+        hits = tracked_3p_references(anchor)
+    except Exception as e:  # noqa: BLE001 — a summary must never fail on this
+        print(f"warning: could not check tracked files for .3p links: {e}", file=sys.stderr)
+        return []
+    if not hits:
+        return []
+    print(f"warning: {len(hits)} tracked line(s) reference .3p/ — see summary.md",
+          file=sys.stderr)
+    out = ["## ⚠ Tracked files reference .3p/", "",
+           "`.3p/` is local, ignored scratch: these links break for everyone else "
+           "and disappear when runs are pruned. Summarise the evidence in the doc, "
+           "point to the PR or ticket, and move reusable scripts into the repo.", ""]
+    for path, line, text in hits[:_TRACKED_LINK_LIMIT]:
+        if should_exclude(path, secret_patterns):
+            text = "(excerpt hidden: file matches a secret pattern)"
+        out.append(f"- `{path}:{line}` — {text[:160]}")
+    if len(hits) > _TRACKED_LINK_LIMIT:
+        out.append(f"- …and {len(hits) - _TRACKED_LINK_LIMIT} more")
+    return out + [""]
+
+
+def _load_run_state(run_dir: Path) -> dict:
+    """A run's state.json if it really is 3p state; ValueError(reason) if not."""
+    state = read_state(run_dir)
+    if not isinstance(state, dict):
+        raise ValueError("state.json is not a JSON object")
+    slug = state.get("taskSlug")
+    if not isinstance(slug, str) or not run_dir.name.startswith(slug + "-"):
+        raise ValueError("state.json does not belong to this run (taskSlug)")
+    if not isinstance(state.get("phase"), str):
+        raise ValueError("state.json has no phase")
+    if not isinstance(state.get("resolvedConfig"), dict):
+        raise ValueError("state.json has no resolvedConfig")
+    if not isinstance(state.get("timeline", []), list):
+        raise ValueError("state.json timeline is not a list")
+    return state
+
+
+def _finished_at(run_dir: Path, state: dict):
+    """When the run reached `done`: last phase=done timeline event, else the
+    state file's mtime (runs from before the timeline existed)."""
+    for ev in reversed(state.get("timeline", [])):
+        if isinstance(ev, dict) and ev.get("kind") == "phase" and ev.get("label") == "done":
+            ts = _parse_iso(ev.get("ts"))
+            if ts:
+                return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    return datetime.fromtimestamp((run_dir / "state.json").stat().st_mtime, timezone.utc)
+
+
+# Why prune kept something, grouped for the one-line summary at init.
+_KEEP_CATEGORIES = ("unfinished", ".keep", "linked", "not a run", "invalid", "error")
+
+
+def _classify_run(entry: Path, tracked: dict, days: int, now) -> tuple:
+    """("keep", category, reason) | ("delete", age_days) | ("young", state)."""
+    name = entry.name
+    if entry.is_symlink():
+        return ("keep", "not a run", "symlink, not a run folder")
+    if not entry.is_dir():
+        return ("keep", "not a run", "loose file, not a run folder")
+    if not (entry / "state.json").is_file() or not _RUN_ID_RE.match(name):
+        return ("keep", "not a run", "not a 3p run (no state.json)")
+    try:
+        state = _load_run_state(entry)
+    except (OSError, ValueError) as e:
+        return ("keep", "invalid", f"invalid state.json: {e}")
+    if state["phase"] != "done":
+        return ("keep", "unfinished", f"unfinished (phase {state['phase']!r})")
+    if (entry / ".keep").exists():
+        return ("keep", ".keep", "has a .keep file")
+    if name in tracked:
+        files = sorted(tracked[name])
+        return ("keep", "linked", "linked from tracked file(s): " + ", ".join(files[:3])
+                + (f" (+{len(files) - 3} more)" if len(files) > 3 else ""))
+    age = (now - _finished_at(entry, state)).total_seconds() / 86400
+    if state.get("deletingAt"):
+        # An earlier prune already chose to delete this run and was interrupted;
+        # marking it rewrote state.json, so its mtime no longer dates the run.
+        return ("delete", age)
+    return ("delete", age) if age >= days else ("young", state)
+
+
+def prune_runs(anchor: Path, apply: bool, days: int, compact_young: bool = False,
+               skip_run: str = None) -> dict:
+    """Delete finished runs older than `days` (with their refs). Everything else
+    is kept and reported: unfinished runs, folders and files that are not 3p
+    runs, invalid state, runs holding a `.keep` file, and runs a tracked file
+    still links to. With compact_young, finished runs inside the window are
+    compacted. Report mode (apply=False) changes nothing."""
+    report = {"lines": [], "deleted": 0, "kept": 0, "freedBytes": 0,
+              "keptByCategory": {}}
+    base = anchor / ".3p"
+    if not base.is_dir():
+        return report
+    _, is_git = find_anchor()
+    tracked = _tracked_3p_run_refs(anchor) if is_git else {}
+    now = datetime.now(timezone.utc)
+
+    def keep(name, category, why):
+        report["kept"] += 1
+        report["keptByCategory"][category] = report["keptByCategory"].get(category, 0) + 1
+        report["lines"].append(f"kept {name}: {why}")
+
+    for entry in sorted(base.iterdir()):
+        name = entry.name
+        if name == skip_run or (name == "config.json" and entry.is_file()):
+            continue
+        try:
+            verdict = _classify_run(entry, tracked, days, now)
+            if verdict[0] == "keep":
+                keep(name, verdict[1], verdict[2])
+            elif verdict[0] == "delete":
+                age = verdict[1]
+                if not apply:
+                    size = _disk_usage(entry)
+                    report["deleted"] += 1
+                    report["freedBytes"] += size
+                    report["lines"].append(f"would delete {name}: finished "
+                                           f"{age:.0f} days ago ({_fmt_bytes(size)})")
+                    continue
+
+                def still_eligible(entry=entry):
+                    again = _classify_run(entry, tracked, days, datetime.now(timezone.utc))
+                    if again[0] == "delete":
+                        return True, ""
+                    return False, (again[2] if again[0] == "keep"
+                                   else "no longer older than the retention period")
+
+                result = _purge_run(anchor, name, is_git, still_eligible)
+                if result["deleted"]:
+                    report["deleted"] += 1
+                    report["freedBytes"] += result["freedBytes"]
+                    report["lines"].append(f"deleted {name}: finished {age:.0f} days "
+                                           f"ago ({_fmt_bytes(result['freedBytes'])})")
+                else:
+                    keep(name, "error", result["reason"])
+            elif compact_young and not verdict[1].get("compactedAt"):
+                if not apply:
+                    report["lines"].append(f"would compact {name}")
+                    continue
+                r = compact_run(entry)
+                report["freedBytes"] += r["freedBytes"]
+                report["lines"].append(_compact_report_line(name, r))
+        except Exception as e:  # noqa: BLE001 — one bad entry never stops the scan
+            keep(name, "error", f"skipped after error: {e}")
+    return report
+
+
+def cmd_prune(args: list) -> int:
+    usage = "Usage: 3p.py prune [--apply] [--compact] [--dry-run] [--days N]"
+    apply = compact = dry = False
+    days = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--apply":
+            apply = True
+        elif a == "--compact":
+            compact = True
+        elif a == "--dry-run":
+            dry = True
+        elif a == "--days" and i + 1 < len(args):
+            try:
+                days = int(args[i + 1])
+            except ValueError:
+                days = -1
+            if days < 0:
+                print(f"--days expects a non-negative integer\n{usage}", file=sys.stderr)
+                return 2
+            i += 1
+        else:
+            print(usage, file=sys.stderr)
+            return 2
+        i += 1
+    if apply and dry:
+        print("--apply and --dry-run cannot be combined", file=sys.stderr)
+        return 2
+    anchor, _ = find_anchor()
+    if days is None:
+        days = load_config(anchor)["retention"]["days"]
+    if days == 0:
+        print("pruning is disabled (retention.days is 0); pass --days N to override")
+        return 0
+    report = prune_runs(anchor, apply=apply, days=days, compact_young=compact)
+    for line in report["lines"]:
+        print(line)
+    if apply:
+        print(f"deleted {report['deleted']} run(s), kept {report['kept']}, "
+              f"freed {_fmt_bytes(report['freedBytes'])}")
+    else:
+        print(f"report only, no changes made: would delete {report['deleted']} "
+              f"run(s) older than {days} days ({_fmt_bytes(report['freedBytes'])}), "
+              f"keep {report['kept']}. Re-run with --apply to delete.")
+    return 0
+
+
+def _auto_prune(anchor: Path, new_run_id: str, cfg: dict) -> None:
+    """Delete expired finished runs when a new run starts. Never raises and
+    never writes to stdout (the skill reads init's stdout as the run-id)."""
+    try:
+        days = cfg.get("retention", {}).get("days", DEFAULTS["retention"]["days"])
+        if not days:
+            return
+        report = prune_runs(anchor, apply=True, days=days, skip_run=new_run_id)
+        for line in report["lines"]:
+            if line.startswith("deleted "):
+                print(f"3p auto-prune: {line}", file=sys.stderr)
+        if report["deleted"]:
+            print(f"3p auto-prune: freed {_fmt_bytes(report['freedBytes'])} "
+                  f"(finished runs older than {days} days; keep one with a .keep "
+                  f"file, or set retention.days to 0)", file=sys.stderr)
+        if report["kept"]:
+            parts = [f"{report['keptByCategory'][c]} {c}" for c in _KEEP_CATEGORIES
+                     if report["keptByCategory"].get(c)]
+            print(f"3p auto-prune: kept {report['kept']} item(s) it will not delete "
+                  f"automatically ({', '.join(parts)}); run `3p.py prune` for details",
+                  file=sys.stderr)
+    except Exception as e:  # noqa: BLE001 — init must never fail because of this
+        print(f"warning: 3p auto-prune skipped: {e}", file=sys.stderr)
 
 
 def cmd_consolidate_final(args: list) -> int:
@@ -3345,6 +4019,8 @@ def main(argv: list) -> int:
         "consolidate-final": cmd_consolidate_final,
         "list": cmd_list,
         "clean": cmd_clean,
+        "compact": cmd_compact,
+        "prune": cmd_prune,
     }
     if cmd not in dispatcher:
         print(f"Unknown subcommand: {cmd}\n\n{USAGE}", file=sys.stderr)

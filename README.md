@@ -109,6 +109,8 @@ If the reviewer calls fail with "tool not found" or similar, see PAL MCP setup a
 /3p --resume <task-slug>     # Resume an interrupted run
 /3p --list                   # List recent runs in this repo
 /3p --clean <task-slug>      # Remove a run's artifacts + git refs
+/3p --prune [--apply]        # Report (or delete) finished runs past retention
+/3p --compact <task-slug>    # Compact one finished run
 /3p --model-power            # Prompt to choose high or low reviewer models
 /3p --model-power high       # Use high-power reviewer models for future runs
 /3p --model-power low        # Use faster/lighter reviewer models for future runs
@@ -187,11 +189,24 @@ Throughout all phases, Claude keeps you informed in chat — each reviewer findi
 - Never runs `git commit`, `git push`, `git tag`, deploy, or publish.
 - Never modifies existing git branches/tags/refs (only writes to `refs/3p/<run-id>/*`).
 - Hardcoded secret-pattern list (`.env`, `*.pem`, `*.key`, `id_rsa*`, `**/.aws/credentials`, `**/credentials.json`, etc.) is non-overridable — those files NEVER enter reviewer prompts.
-- All file artifacts go under `<repo>/.3p/<run-id>/` (auto-`.gitignore`d).
+- All file artifacts go under `<repo>/.3p/<run-id>/` (auto-`.gitignore`d). That folder is local scratch: never link to it from tracked files. The end-of-run summary warns if any tracked file does.
 
 ### Audit trail
 
 Every reviewer round writes a per-reviewer file: `plan-round-N-<reviewer>.md`, `step-M-round-N-<reviewer>.md`, `final-round-N-<reviewer>.md` (think mode: `think-round-N-<reviewer>.md`, next to `memo.md`). Each file contains findings, Claude's verdicts with reasons, and any rebuttal exchanges. A final `summary.md` consolidates everything plus a per-round reviewer-availability log.
+
+### Storage & retention
+
+`.3p/` stays small without manual cleanup:
+
+| When | What happens |
+|---|---|
+| Every snapshot | Ignored paths are recorded compactly: nothing under `.3p/` or `.git/`, and a wholly-ignored folder like `node_modules/` is a single entry. |
+| A run finishes (`done`) | The run compacts itself. It deletes its baseline file copies (only once `final-diff.txt` holds the cumulative diff) and any `node_modules/`, `.next/` or `dist/` folders agents left in it. The plan, review rounds, summaries, diffs and dashboard are kept, and the `refs/3p/<run-id>/*` git refs still hold each baseline's **tracked** files (as `git stash create` records them; untracked files are not in the ref). |
+| A new run starts (`init`) | Finished runs older than `retention.days` (default 30) are deleted with their git refs. Unfinished runs, folders that aren't 3p runs, runs with a `.keep` file and runs whose folder name appears in a tracked file are never deleted automatically; they're reported on stderr instead. |
+| You ask | `/3p --prune` shows what would be deleted without changing anything. Add `--apply` to delete, `--compact` to also compact younger finished runs, or `--days N` to use a different age. `/3p --compact <run>` compacts one finished run. |
+
+To keep a run for good, create an empty `.keep` file in its folder. To turn pruning off, set `"retention": {"days": 0}`.
 
 ---
 
@@ -216,7 +231,8 @@ Built-in defaults can be overridden by a `.3p/config.json` file at your repo roo
     }
   },
   "excludes": ["custom_dir/"],
-  "extraExcludes": ["more_dir/"]
+  "extraExcludes": ["more_dir/"],
+  "retention": { "days": 30 }
 }
 ```
 
@@ -232,6 +248,7 @@ Built-in defaults can be overridden by a `.3p/config.json` file at your repo roo
 | `excludes` | (default bloat list) | **Replaces** default `node_modules/`, `dist/`, etc. |
 | `extraExcludes` | `[]` | **Appends** to defaults |
 | `secretPatterns` | (hardcoded list) | User can extend; hardcoded patterns CANNOT be removed |
+| `retention.days` | `30` | Finished runs older than this are pruned when a new run starts; `0` disables pruning |
 
 ### Auto-update
 
