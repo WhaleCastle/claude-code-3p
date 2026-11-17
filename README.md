@@ -129,6 +129,8 @@ If the reviewer calls fail with "tool not found" or similar, see PAL MCP setup a
 
 `/3p` uses PAL `clink` roles to choose reviewer models. Models are selected on **two axes**: `power` (`high`/`low`) × `reviewType` (`reasoning` for plan/final, `code` for per-step build review). The installer creates a role for every (power, reviewType) pair per CLI, and each run resolves a model-specific PAL role from the model names frozen into that run's `state.resolvedConfig`.
 
+The table shows the **built-in defaults**. A machine-wide or project config (see below) overrides them per slot, so run `/3p --models` to see the models actually in use.
+
 | Power | Reviewer | `reasoning` (plan/final) | `code` (per-step) | Use when |
 |---|---|---|---|---|
 | `high` | Codex | `gpt-5.5` | `gpt-5.5` | Deep review, risky changes, architecture/security-sensitive work |
@@ -136,7 +138,7 @@ If the reviewer calls fail with "tool not found" or similar, see PAL MCP setup a
 | `low` | Codex | `gpt-5.4-mini` | `gpt-5.4-mini` | Faster review for smaller or lower-risk tasks |
 | `low` | Antigravity | `Gemini 3.1 Pro (Low)` | `Gemini 3.5 Flash (Low)` | " |
 
-Codex uses the same model for both review types; Antigravity reviews reasoning (plan/final) with the Pro model and code (per-step) with the Flash model.
+By default Codex uses the same model for both review types, and Antigravity reviews reasoning (plan/final) with the Pro model and code (per-step) with the Flash model.
 
 Run this to choose without remembering the values:
 
