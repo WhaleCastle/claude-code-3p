@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """3p — three-party review skill helper. Subcommand-based CLI."""
 import sys
+import bisect
 import contextlib
 import fnmatch
 import hashlib
@@ -1270,7 +1271,51 @@ def _harden_cli_client(cli_name: str, client: dict) -> None:
                 AGY_TIMEOUT_BACKSTOP_SECONDS, int(print_secs) + AGY_WRAPPER_MARGIN_SECONDS)
 
 
+# PAL puts a role's system prompt in front of every clink request. Its stock
+# codereviewer prompt asks for a Critical/High/Medium/Low report that ends in a
+# <SUMMARY> block, which contradicts 3p's Response Contract; Antigravity in
+# particular follows the system prompt and answers in markdown that the parser
+# then rejects. So 3p's reviewer roles get their own system prompt that agrees
+# with the contract, installed outside PAL's tree. The user's own
+# `codereviewer` role is left as it is. Both 3p editions (Codex and Claude
+# Code) write this same file, so prompts/reviewer-system.txt must stay
+# identical in both, or each install would flip the other's text.
+REVIEWER_SYSTEM_PROMPT_SOURCE = (
+    Path(__file__).resolve().parents[1] / "prompts" / "reviewer-system.txt")
+
+
+def reviewer_system_prompt_path() -> Path:
+    return Path.home() / ".pal" / "3p" / "reviewer-system.txt"
+
+
+def install_reviewer_system_prompt():
+    """Write the 3p reviewer system prompt where PAL can read it and return its
+    path, or None when the skill's copy is missing. A role must never point at
+    a file that does not exist: PAL then fails to load every CLI client."""
+    try:
+        text = REVIEWER_SYSTEM_PROMPT_SOURCE.read_text()
+    except OSError:
+        print(f"warning: {REVIEWER_SYSTEM_PROMPT_SOURCE} is missing; 3p reviewer "
+              f"roles keep PAL's stock codereviewer prompt", file=sys.stderr)
+        return None
+    dst = reviewer_system_prompt_path()
+    if not dst.is_file() or dst.read_text() != text:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        # A per-process temp name: the two reviewer-role calls of a round run
+        # in parallel and both install.
+        tmp = dst.with_name(f"{dst.name}.{os.getpid()}.tmp")
+        tmp.write_text(text)
+        tmp.replace(dst)
+    return dst
+
+
+# Role names install_pal_config generates: reviewer_role_name and
+# stable_model_role_name. Nothing else in a client's roles is 3p's to change.
+_GENERATED_ROLE = re.compile(r"codereviewer-(?:low|high)-(?:reasoning|code)(?:-[0-9a-f]{10})?\Z")
+
+
 def install_pal_config(cfg: dict) -> None:
+    system_prompt = install_reviewer_system_prompt()
     for reviewer in sorted(MODEL_REVIEWERS):
         cli_name = REVIEWER_CLI[reviewer]
         client = load_cli_client_config(reviewer)
@@ -1282,7 +1327,9 @@ def install_pal_config(cfg: dict) -> None:
         client.setdefault("env", {})
         roles = client.setdefault("roles", {})
         base_role = roles.get("codereviewer") or DEFAULT_CLI_CLIENTS[reviewer]["roles"]["codereviewer"]
-        prompt_path = base_role.get("prompt_path") or DEFAULT_CLI_CLIENTS[reviewer]["roles"]["codereviewer"]["prompt_path"]
+        prompt_path = (str(system_prompt) if system_prompt else
+                       base_role.get("prompt_path")
+                       or DEFAULT_CLI_CLIENTS[reviewer]["roles"]["codereviewer"]["prompt_path"])
         for power in sorted(MODEL_POWERS):
             for review_type in sorted(REVIEW_TYPES):
                 model_name = cfg["models"][reviewer][power][review_type]
@@ -1293,6 +1340,14 @@ def install_pal_config(cfg: dict) -> None:
                 roles[reviewer_role_name(power, review_type)] = role
                 roles[stable_model_role_name(
                     power, reviewer, review_type, model_name)] = role
+        # Model-pinned roles left by runs with other models (a project config,
+        # an older default) get the same prompt as the current roles. Without
+        # this they would keep PAL's stock prompt until that run reinstalls
+        # them, or, when the skill's prompt copy is missing and the fallback is
+        # in use, keep pointing at a reviewer-system.txt that may be gone.
+        for name, role in roles.items():
+            if _GENERATED_ROLE.match(name) and isinstance(role, dict):
+                role["prompt_path"] = prompt_path
         _harden_cli_client(cli_name, client)
         write_cli_client_config(reviewer, client)
 
@@ -1720,8 +1775,79 @@ def enumerate_files(anchor: Path, user_excludes: list, secret_patterns: list,
     return enumerate_files_nongit(anchor, user_excludes, secret_patterns, gi_rules)
 
 
+# Reviewers are asked for plain `[Severity] title` + `Label: value` lines, but
+# agent CLIs often answer in markdown anyway (headings, bullets, bold labels,
+# "**Verdict: APPROVED**"), largely because PAL's stock codereviewer prompt asks
+# for a Critical/High/Medium/Low report. The parser accepts those dressings so a
+# readable verdict is not thrown away as "unavailable" and the round wasted.
+#
+# Leading decoration a line may carry: indentation, blockquote, a markdown
+# heading, a list marker (`-`, `*`, `+`, `1.`, `1)`), in either order.
+_LEAD = (r"[ \t]*(?:>[ \t]*)*(?:#{1,6}[ \t]+)?"
+         r"(?:(?:[-*+]|\d{1,3}[.)])[ \t]+)?(?:#{1,6}[ \t]+)?")
+# An approval must be the reviewer's own line, not a quoted one ("> APPROVED"
+# under "I cannot return the token:"), so its lead allows no blockquote.
+_LEAD_UNQUOTED = (r"[ \t]*(?:#{1,6}[ \t]+)?"
+                  r"(?:(?:[-*+]|\d{1,3}[.)])[ \t]+)?(?:#{1,6}[ \t]+)?")
+
 _FINDING_HEADER = re.compile(
-    r"^\s*\*{0,2}\[(Blocker|Critical|Important|Risk)\]\*{0,2}\s+(.+?)\s*$",
+    r"^" + _LEAD + r"[*_`]{0,3}\[(?P<label>[^\]\n]{1,40})\][*_`]{0,3}[ \t]*"
+    r"(?:(?::|[-–—](?=[ \t]))[ \t]*)?(?P<title>.*?)[ \t]*$",
+    re.M,
+)
+
+# 3p's own scale, then other scales a reviewer may fall back to (PAL's stock
+# prompt: Critical/High/Medium/Low; Codex: P0-P3). The orchestrator verifies
+# every finding anyway, so a mapped severity only has to keep a real finding
+# from being dropped, not grade it exactly.
+_SEVERITY_CANON = {"blocker": "Blocker", "critical": "Critical",
+                   "important": "Important", "risk": "Risk"}
+_SEVERITY_ALIASES = {"high": "Critical", "major": "Critical",
+                     "medium": "Important", "moderate": "Important",
+                     "p0": "Blocker", "p1": "Critical", "p2": "Important"}
+# Below the bar: such a header still ends the previous finding, but is not one.
+_SEVERITY_BELOW_BAR = {"low", "minor", "nit", "nitpick", "info", "informational",
+                       "trivial", "suggestion", "note", "optional", "p3"}
+_BELOW_BAR = "below-bar"
+
+# A severity header whose "title" is a placeholder ("#### [Critical]" over
+# "*None.*", or "[High] None found") is a section label, not a finding.
+_PLACEHOLDER_TITLE = re.compile(
+    r"[\W_]*(?:none(?:\s+(?:found|identified|remaining))?|n/?a|nil|"
+    r"nothing(?:\s+to\s+report)?|no\s+(?:findings|issues)(?:\s+found)?)[\W_]*",
+    re.I,
+)
+
+# Lines that end a finding's block: a <SUMMARY> tag, a horizontal rule, or a
+# markdown heading that is not itself a finding header.
+_BLOCK_END = re.compile(
+    r"^[ \t]*(?:</?SUMMARY>[ \t]*$|(?:-[ \t]*){3,}$|(?:\*[ \t]*){3,}$|"
+    r"(?:_[ \t]*){3,}$|#{1,6}[ \t])",
+    re.M | re.I,
+)
+
+# `Label: value` with optional bullet/bold dressing: `Location: x`,
+# `- **Location:** x`, `**Location**: x`.
+_FIELD_LINE = re.compile(
+    r"^" + _LEAD + r"(?P<bold>[*_]{0,2})(?P<label>[A-Za-z][A-Za-z &/'-]{0,40}?)"
+    r"[*_]{0,2}[ \t]*:[*_]{0,2}[ \t]*(?P<value>.*)$"
+)
+_FIELD_ALIASES = {
+    "location": "location", "locations": "location", "reference": "location",
+    "references": "location", "file": "location", "files": "location",
+    "where": "location",
+    "issue": "issue", "problem": "issue", "description": "issue",
+    "details": "issue", "finding": "issue",
+    "rationale": "rationale", "impact": "rationale", "failure mode": "rationale",
+    "why": "rationale", "consequence": "rationale",
+}
+
+_APPROVED_LINE = re.compile(
+    r"^" + _LEAD_UNQUOTED + r"[*_`]{0,3}(?:[✅✔☑]️?[ \t]*)?"
+    r"(?:(?i:(?:(?:final|overall|review)[ \t]+)?"
+    r"(?:verdict|decision|status|result|outcome|conclusion|review))"
+    r"[*_`]{0,3}[ \t]*[:\-–—][*_` \t]*(?i:approved)|APPROVED)"
+    r"[*_`.!]*[ \t]*(?:[✅✔☑]️?[ \t]*)?$",
     re.M,
 )
 
@@ -1752,34 +1878,238 @@ def _cap_raw(text: str, limit: int = _MAX_RAW_CHARS) -> str:
     return f"{text[:half]}\n…[{elided} chars elided]…\n{text[-half:]}"
 
 
-def _extract_field(block: str, name: str) -> str:
-    m = re.search(rf"^{name}:\s*(.+?)(?:\n[A-Z][a-z]+:|\Z)", block, re.M | re.S)
-    return m.group(1).strip() if m else ""
+def _resolve_severity(label: str):
+    """Map a bracket label to a 3p severity, _BELOW_BAR, or None (not a
+    severity at all: a checkbox, a link text, a file name)."""
+    tokens = [t.strip("*_`.:()!") for t in re.split(r"[\s/|,+&]+", label.lower())]
+    tokens = [t for t in tokens if t]
+    if not tokens or len(tokens) > 4:
+        return None
+    for t in tokens:
+        if t in _SEVERITY_CANON:
+            return _SEVERITY_CANON[t]
+    for t in tokens:
+        if t in _SEVERITY_ALIASES:
+            return _SEVERITY_ALIASES[t]
+    if all(t in _SEVERITY_BELOW_BAR for t in tokens):
+        return _BELOW_BAR
+    return None
 
 
-def parse_response(text: str) -> dict:
+def _clean_title(title: str) -> str:
+    t = title.strip().strip("*").strip()
+    if len(t) >= 2 and t[0] == t[-1] == "_":
+        t = t[1:-1].strip()
+    return t
+
+
+def _is_field_label(m) -> bool:
+    """A label line ends the previous field when it is a known alias, is
+    bold-dressed (`**Context & Mitigation:**`), or is one capitalized word
+    (`Note:`) — the last being the original parser's rule."""
+    label = m.group("label").strip()
+    return (label.lower() in _FIELD_ALIASES or bool(m.group("bold"))
+            or bool(re.fullmatch(r"[A-Z][a-z]+", label)))
+
+
+def _strip_fence_tail(value: str) -> str:
+    """Drop trailing code-fence lines left when a reviewer wraps its findings in
+    ``` (copying the contract's example block)."""
+    lines = value.rstrip().split("\n")
+    while lines and re.fullmatch(r"[ \t]*(?:```|~~~)\w*[ \t]*", lines[-1]):
+        lines.pop()
+    return "\n".join(lines).strip()
+
+
+_FENCE_LINE = re.compile(r"[ \t]*(`{3,}|~{3,})(.*)")
+
+
+def _fence_opener(line: str):
+    """The fence mark (```, ~~~~, ...) a line opens with, or None."""
+    m = _FENCE_LINE.fullmatch(line)
+    if not m or (m.group(1)[0] == "`" and "`" in m.group(2)):
+        return None                    # ``` must not recur in the info string
+    return m.group(1)
+
+
+def _fence_closes(mark: str, line: str) -> bool:
+    """As in Markdown: a bare line of the same character, at least as long."""
+    m = _FENCE_LINE.fullmatch(line)
+    return (bool(m) and m.group(1)[0] == mark[0]
+            and len(m.group(1)) >= len(mark) and not m.group(2).strip())
+
+
+def _titled_header(line: str) -> bool:
+    """A finding header with a contract (or alias) severity and a real title;
+    "[critical]" alone is an INI section, "[Low] x" is below the bar."""
+    m = _FINDING_HEADER.match(line)
+    if not m or _resolve_severity(m.group("label")) in (None, _BELOW_BAR):
+        return False
+    title = _clean_title(m.group("title"))
+    return bool(title) and not _PLACEHOLDER_TITLE.fullmatch(title)
+
+
+def _fence_layout(text: str):
+    """Classify code fences in one pass, returning (evidence, wrappers) as
+    lists of (content start, content end) offsets.
+
+    A fence that opens inside a finding (after a titled header) is evidence:
+    code, config or quoted text supporting it, whatever it contains. A fence
+    that opens outside any finding wraps the findings list when it contains a
+    titled header (a reviewer copying the contract's example block), and is
+    otherwise an example; examples count as evidence. Inside a wrapper, a
+    fence opened within a finding is evidence too, even though Markdown would
+    read it as plain content of the outer fence."""
+    lines, offset = [], 0
+    for line in text.split("\n"):
+        lines.append((offset, line))
+        offset += len(line) + 1
+    n = len(lines)
+
+    def close_index(mark, i, limit):
+        for k in range(i + 1, limit):
+            if _fence_closes(mark, lines[k][1]):
+                return k
+        return limit
+
+    def content(i, k):
+        return (lines[i][0] + len(lines[i][1]) + 1,
+                lines[k][0] if k < n else len(text))
+
+    evidence, wrappers = [], []
+    in_finding = False
+    wrapper_close = None             # line index of the open wrapper's closing fence
+    i = 0
+    while i < n:
+        line = lines[i][1]
+        if i == wrapper_close:
+            wrapper_close, in_finding = None, False
+            i += 1
+            continue
+        mark = _fence_opener(line)
+        if mark:
+            limit = wrapper_close if wrapper_close is not None else n
+            k = close_index(mark, i, limit)
+            if (not in_finding and wrapper_close is None
+                    and any(_titled_header(l) for _, l in lines[i + 1:k])):
+                wrappers.append(content(i, k))
+                wrapper_close = k
+                i += 1                   # parse the wrapper's content normally
+                continue
+            evidence.append(content(i, k))
+            i = k if k == wrapper_close else k + 1
+            continue
+        if _FINDING_HEADER.match(line) and _resolve_severity(
+                _FINDING_HEADER.match(line).group("label")) is not None:
+            in_finding = _titled_header(line)
+        elif _BLOCK_END.match(line):
+            in_finding = False
+        i += 1
+    return evidence, wrappers
+
+
+def _in_spans(pos: int, spans) -> bool:
+    """`spans` are sorted and non-overlapping (as _fence_layout returns them)."""
+    i = bisect.bisect_right(spans, (pos, float("inf"))) - 1
+    return i >= 0 and spans[i][0] <= pos < spans[i][1]
+
+
+def _extract_fields(block: str, offset: int = 0, evidence=()) -> dict:
+    """`offset` is the block's position in the parsed text; lines inside an
+    `evidence` fence are field content, never a new label."""
+    fields = {}
+    preamble = []
+    current = None
+    pos = offset
+    for line in block.split("\n"):
+        line_start, pos = pos, pos + len(line) + 1
+        m = None if _in_spans(line_start, evidence) else _FIELD_LINE.match(line)
+        if m and _is_field_label(m):
+            key = _FIELD_ALIASES.get(m.group("label").strip().lower())
+            if key and key not in fields:
+                fields[key] = [m.group("value")]
+                current = key
+            else:
+                current = None          # an ignored label (Fix:, Context:) or a repeat
+            continue
+        if current:
+            fields[current].append(line)
+        elif not fields:
+            preamble.append(line)
+    out = {k: _strip_fence_tail("\n".join(v)) for k, v in fields.items()}
+    # Markdown-style findings often describe the problem in a paragraph under
+    # the header before any label; use it when there is no Issue field.
+    if not out.get("issue"):
+        out["issue"] = _strip_fence_tail("\n".join(preamble))
+    return out
+
+
+def parse_response(raw_text: str) -> dict:
+    text = raw_text.replace("\r\n", "\n")
+    # Put <SUMMARY> tags that open or close a line on lines of their own, so
+    # they end a finding's block and a one-line `<SUMMARY>APPROVED</SUMMARY>`
+    # still reads as APPROVED. A tag in the middle of a sentence ("I cannot
+    # return <SUMMARY>APPROVED</SUMMARY> yet") stays put: splitting it would
+    # turn prose into an approval line.
+    text = re.sub(r"^[ \t]*(</?SUMMARY>)[ \t]*", r"\1\n", text, flags=re.I | re.M)
+    text = re.sub(r"[ \t]*(</?SUMMARY>)[ \t]*$", r"\n\1", text, flags=re.I | re.M)
+    # Code fences hold evidence (a Python `# comment`, YAML `---` or
+    # `description:`, an INI `[critical]` section) that is not report
+    # structure, unless they wrap the findings list; see _fence_layout.
+    evidence, wrappers = _fence_layout(text)
+    headers = []
+    for m in _FINDING_HEADER.finditer(text):
+        severity = _resolve_severity(m.group("label"))
+        if severity is not None and not _in_spans(m.start(), evidence):
+            headers.append((m, severity))
     findings = []
-    matches = list(_FINDING_HEADER.finditer(text))
-    for i, m in enumerate(matches):
-        severity = m.group(1)
-        title = m.group(2).strip()
+    seen = set()
+    for i, (m, severity) in enumerate(headers):
+        title = _clean_title(m.group("title"))
+        if severity == _BELOW_BAR or not title or _PLACEHOLDER_TITLE.fullmatch(title):
+            continue
         start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        end = headers[i + 1][0].start() if i + 1 < len(headers) else len(text)
+        stop = next((s for s in _BLOCK_END.finditer(text, start, end)
+                     if not _in_spans(s.start(), evidence)), None)
+        if stop:
+            end = stop.start()
+        # The closing line of a wrapper fence ends the finding too, so text
+        # after the fence is not absorbed into its last field.
+        for w_start, w_end in wrappers:
+            if w_start <= start < w_end < end:
+                end = w_end
         block = text[start:end]
+        fields = _extract_fields(block, start, evidence)
+        full = {"severity": severity, "title": title,
+                "location": fields.get("location", ""),
+                "issue": fields.get("issue", ""),
+                "rationale": fields.get("rationale", "")}
+        # A reviewer that repeats a finding word for word (e.g. again inside
+        # <SUMMARY>) must not double it. Only exact repeats are dropped: two
+        # findings that share a title but differ in location or content are
+        # separate defects and both stay. Only whitespace is normalised; case
+        # and punctuation can tell paths apart (src/api-user.py vs
+        # src/api/user.py). The key uses the full fields, before truncation.
+        key = tuple(" ".join(v.split()) for v in full.values())
+        if key in seen:
+            continue
+        seen.add(key)
         # Each field is bounded: a trailing transcript with no further field
         # label would otherwise let the last finding's Rationale absorb it all.
-        findings.append({
-            "severity": severity,
-            "title": _truncate(title),
-            "location": _truncate(_extract_field(block, "Location")),
-            "issue": _truncate(_extract_field(block, "Issue")),
-            "rationale": _truncate(_extract_field(block, "Rationale")),
-        })
+        findings.append({k: (v if k == "severity" else _truncate(v))
+                         for k, v in full.items()})
     if findings:
         return {"status": "findings", "findings": findings}
-    if re.search(r"^APPROVED\s*$", text, re.M):
+    # A dressed approval ("**Verdict: APPROVED**") counts only outside
+    # evidence fences, where it is not an example. A line that was a bare
+    # APPROVED in the reviewer's own text counts anywhere, as it always has;
+    # this is checked before the <SUMMARY> rewrite, which must not turn a
+    # fenced `<SUMMARY>APPROVED</SUMMARY>` example into one.
+    if (any(not _in_spans(m.start(), evidence) for m in _APPROVED_LINE.finditer(text))
+            or re.search(r"^APPROVED\s*$", raw_text.replace("\r\n", "\n"), re.M)):
         return {"status": "approved", "findings": []}
-    return {"status": "unavailable", "raw": _cap_raw(text), "findings": []}
+    return {"status": "unavailable", "raw": _cap_raw(raw_text), "findings": []}
 
 
 def cmd_parse_response(args: list) -> int:

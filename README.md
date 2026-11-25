@@ -278,7 +278,9 @@ claude-code-3p/
 │   ├── plan-review.md        # Phase A reviewer prompt template
 │   ├── step-review.md        # Phase B reviewer prompt template
 │   ├── final-review.md       # Phase C reviewer prompt template
-│   └── think-review.md       # Think-mode memo reviewer prompt template
+│   ├── think-review.md       # Think-mode memo reviewer prompt template
+│   ├── format-repair.md      # One re-ask when a reply does not follow the contract
+│   └── reviewer-system.txt   # PAL system prompt for 3p reviewer roles
 └── tests/
     └── test_*.py             # pytest suite covering all helpers
 ```
@@ -305,6 +307,9 @@ PAL MCP, codex CLI, or agy (Antigravity) CLI is not configured. See [PAL MCP set
 
 **Antigravity reviewer fails with "CLI 'antigravity' is not configured" / parser error**
 PAL binds its output parser to a fixed set of cli names, so the Antigravity reviewer must be reached as `cli_name=agy` (3p does this automatically; its PAL config is written to `~/.pal/cli_clients/agy.json` with `"name": "agy"`). Confirm `which agy` resolves and that your PAL build ships the `agy` client.
+
+**A reviewer (usually Antigravity) is marked `unavailable (garbled)` although it answered**
+The reply did not contain a verdict 3p could read. Three layers handle this: 3p's reviewer roles use their own PAL system prompt (`~/.pal/3p/reviewer-system.txt`, from `prompts/reviewer-system.txt`) instead of PAL's stock codereviewer prompt, whose Critical/High/Medium/Low report and `<SUMMARY>` block contradicted the response contract; `parse-response` accepts markdown dressing such as `### [Important] …`, bold field labels and `**Verdict: APPROVED**`; and an unreadable reply gets one format-repair re-ask in the same round (`prompts/format-repair.md`, saved as `<round-prefix>-<reviewer>.repair.raw.txt`). If it still happens, restart Claude Code so PAL loads the reviewer roles that point at the new system prompt, then read the `.raw.txt` and `.repair.raw.txt` files to see what the reviewer sent.
 
 **`/3p` runs the same task forever / hits round cap repeatedly**
 This is expected if reviewers genuinely keep finding new issues each round. Inspect `.3p/<run-id>/plan-round-N-*.md` files to see what they're flagging. Adjust `roundCap` in `.3p/config.json` if you want stricter cap, or accept the cap-reached exit (Claude will apply all remaining `accepted` findings before stopping).

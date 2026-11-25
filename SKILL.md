@@ -244,9 +244,10 @@ For each round:
 
 4. For each reviewer's response:
    - Save the raw text to `.3p/<run-id>/<round-prefix>-<reviewer>.raw.txt`
-   - Parse it: `3PSH parse-response <raw-file>` → JSON `{status, findings, raw?}`
-   - If status is `unavailable` OR the `clink` call errored, mark the reviewer as having failed this round (record reason: `timeout` / `error` / `garbled`)
-   - Append an entry to the historical availability log: `3PSH availability-append <run-id> '<entry-json>'`. Entry shape: `{phase, step, round, reviewer, status: "responded"|"unavailable", reason?, durationSeconds}`. Set `durationSeconds` from the reviewer's `metadata.duration_seconds` (see Per-reviewer latency above). Call this for BOTH reviewers on every round, whether they responded or failed.
+   - Parse it: `3PSH parse-response <raw-file>` → JSON `{status, findings, raw?}`. The parser already accepts common markdown dressing (headings, bullets or bold around `[Severity]`, bold field labels, `**Verdict: APPROVED**`, a trailing `<SUMMARY>`), so `unavailable` means it found no verdict at all.
+   - **Format repair (at most once per reviewer per round).** If status is `unavailable` but the `clink` call itself succeeded — the reviewer answered, just not in the contract format (a free-form report, an approval only inside a sentence, or a reply that stopped while "standing by" for a background task) — do not mark it failed yet. Re-ask that reviewer once: `clink` with the same `cli_name` and `role`, the `continuation_id` from this call, and the prompt `prompts/format-repair.md` with `{{previous_reply}}` filled from the parse result's `raw`. Save the reply to `<round-prefix>-<reviewer>.repair.raw.txt` and parse it. If it parses, it is this reviewer's response for the round; its `durationSeconds` is the two calls' `metadata.duration_seconds` added. Never repair twice in one round, and never repair a `clink` error or timeout.
+   - If status is still `unavailable` after the repair, OR the `clink` call errored, mark the reviewer as having failed this round (record reason: `timeout` / `error` / `garbled`)
+   - Append an entry to the historical availability log: `3PSH availability-append <run-id> '<entry-json>'`. Entry shape: `{phase, step, round, reviewer, status: "responded"|"unavailable", reason?, durationSeconds, repaired?}`; add `"repaired": true` when the response came from the format repair. Set `durationSeconds` from the reviewer's `metadata.duration_seconds` (see Per-reviewer latency above). Call this for BOTH reviewers on every round, whether they responded or failed.
 5. **Detect failures.** Update `state.reviewerHealth.<reviewer>.consecutiveFailures` (increment on failure, reset to 0 on responded). If a reviewer hit `consecutiveFailuresForDowngrade`, **pause and surface the downgrade menu** (see Persistent-reviewer downgrade §).
 6. If **both** reviewers failed: pause and surface the both-down menu. Wait for user.
 7. **Verify findings.** For each available reviewer's findings, decide a verdict:
@@ -353,7 +354,7 @@ On `--resume <slug>`:
 - Round file names (per-reviewer, race-free): `plan-round-N-<reviewer>.md`, `step-M-round-N-<reviewer>.md`, `final-round-N-<reviewer>.md`, and in think mode `think-round-N-<reviewer>.md`. A think run's artifacts are `memo.md` + those round files + `summary.md`. The summary/consolidate helpers glob all matching files at read time.
 - Step summary: `step-M-summary.md`
 - Final summary: `summary.md`
-- Raw reviewer responses: `<round-prefix>-<reviewer>.raw.txt` (for debugging and `parse-response` input)
+- Raw reviewer responses: `<round-prefix>-<reviewer>.raw.txt` (for debugging and `parse-response` input); a format-repair reply is `<round-prefix>-<reviewer>.repair.raw.txt`
 
 ## Storage & retention
 
