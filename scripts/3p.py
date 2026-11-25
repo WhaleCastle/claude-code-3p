@@ -973,6 +973,11 @@ def cmd_models(args: list) -> int:
             print("Usage: 3p.py models set [--global] <codex|antigravity> "
                   "<low|high> <reasoning|code> <model>", file=sys.stderr)
             return 2
+        try:
+            model_role_args(REVIEWER_CLI[reviewer], model_name.strip())
+        except SystemExit as exc:
+            print(exc, file=sys.stderr)
+            return 2
         raw = read_user_config() if is_global else read_project_config(anchor)
         if not isinstance(raw.get("models", {}), dict):
             raw["models"] = {}
@@ -1314,6 +1319,27 @@ def install_reviewer_system_prompt():
 _GENERATED_ROLE = re.compile(r"codereviewer-(?:low|high)-(?:reasoning|code)(?:-[0-9a-f]{10})?\Z")
 
 
+# A Codex slot may pin a reasoning effort: `gpt-6.2-sol@high` runs
+# `--model gpt-6.2-sol -c model_reasoning_effort=high`. Without `@`, Codex uses
+# its own default effort (~/.codex/config.toml). Other reviewers' model ids
+# already carry their tier (gemini-4-neon-high), so `@` is Codex-only.
+_EFFORT = re.compile(r"[a-z]+")
+
+
+def model_role_args(cli_name: str, spec: str) -> list:
+    """PAL role_args for a configured model spec; SystemExit on a bad spec."""
+    model, sep, effort = spec.partition("@")
+    if not sep:
+        return ["--model", spec]
+    if cli_name != "codex":
+        raise SystemExit(f"Model {spec!r}: '@<effort>' is only supported for the "
+                         f"Codex reviewer; {cli_name} model ids carry their own tier")
+    if not model or not _EFFORT.fullmatch(effort):
+        raise SystemExit(f"Model {spec!r}: expected <model>@<effort>, e.g. "
+                         f"gpt-6.2-sol@high (effort in lowercase letters)")
+    return ["--model", model, "-c", f"model_reasoning_effort={effort}"]
+
+
 def install_pal_config(cfg: dict) -> None:
     system_prompt = install_reviewer_system_prompt()
     for reviewer in sorted(MODEL_REVIEWERS):
@@ -1335,7 +1361,7 @@ def install_pal_config(cfg: dict) -> None:
                 model_name = cfg["models"][reviewer][power][review_type]
                 role = {
                     "prompt_path": prompt_path,
-                    "role_args": ["--model", model_name],
+                    "role_args": model_role_args(cli_name, model_name),
                 }
                 roles[reviewer_role_name(power, review_type)] = role
                 roles[stable_model_role_name(

@@ -151,11 +151,13 @@ The choice is saved in `.3p/config.json` as `modelPower` and applies to new runs
 Advanced users can change what low/high mean:
 
 ```
-/3p --models set codex high reasoning gpt-6.0
+/3p --models set codex high reasoning gpt-6.0@high   # pin Codex reasoning effort
 /3p --models set codex low code gpt-5.4-mini
 /3p --models set antigravity high reasoning "Gemini 3.1 Pro (High)"
 /3p --models set antigravity low code "Gemini 3.5 Flash (Low)"
 ```
+
+A Codex model may carry `@<effort>` (one of the model's reasoning levels, e.g. `low`, `high`, `xhigh`); 3p passes it as `-c model_reasoning_effort=<effort>`, and without it Codex uses the effort from `~/.codex/config.toml`. Antigravity ids already include their tier, so `@` is Codex-only.
 
 After changing model mappings with `/3p --models set ...` or a config file, restart Claude Code so PAL MCP reloads the updated role arguments. If PAL MCP is running as a separate process, restart that process instead. Changing only `/3p --model-power high|low` does not require a restart after the roles have been loaded once.
 
